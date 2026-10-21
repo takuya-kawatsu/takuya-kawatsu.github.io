@@ -1,0 +1,765 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DGX Spark 8 台の vLLM 性能チューニング</title>
+<meta name="description" content="8 台の NVIDIA DGX Spark（GB10）で DeepSeek-V4.1-Flash を TP=8 で配信する vLLM のデコードを、カーネル選択・one-shot RDMA all-reduce・L2 先読みで 2.3 倍にした技術報告。">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Sans+JP:wght@400;500;700&amp;family=Noto+Serif+JP:wght@400;600;700&amp;display=swap">
+<style>
+/* 版面: 和文の技術論文。本文は中央の 1 段（1 行およそ 40 字）、図と表は本文より広く張り出す。
+   節・図・表・式・文献に通し番号を付け、表は上・見出しの下・下の太い罫と細い区切りで組む。 */
+:root {
+  --paper: #fcfcfb;
+  --ink: #16191d;
+  --ink-2: #3a4047;
+  --muted: #69707a;
+  --rule: #d5d9de;
+  --rule-strong: #2a2f35;
+  --tint: #f1f3f5;
+  --accent: #1f4f8a;
+  --accent-soft: #e3ebf5;
+  --ar: #e4e7eb;
+  --bar-base: #6da7ec;
+  --bar-range: #1c5cab;
+  --bar-muted-base: #a7aeb6;
+  --bar-muted-range: #5d6570;
+  --s1: #2a78d6;
+  --s2: #eb6834;
+  --s3: #1baf7a;
+  --s4: #eda100;
+  --s5: #e87ba4;
+  --on-s1: #ffffff;
+  --on-fill: #16191d;
+  --font-serif: "Noto Serif JP", "Hiragino Mincho ProN", "Yu Mincho", YuMincho, serif;
+  --font-sans: "Noto Sans JP", "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic", YuGothic, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --measure: 41rem;
+  --wide: 60rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #14161a;
+    --ink: #e6e8eb;
+    --ink-2: #c2c7cd;
+    --muted: #969ea8;
+    --rule: #30353c;
+    --rule-strong: #d3d7dc;
+    --tint: #1c1f24;
+    --accent: #8db4e8;
+    --accent-soft: #1d2a3b;
+    --ar: #272b32;
+    --bar-base: #1c5cab;
+    --bar-range: #6da7ec;
+    --bar-muted-base: #49505a;
+    --bar-muted-range: #9aa2ab;
+    --s1: #3987e5;
+    --s2: #d95926;
+    --s3: #199e70;
+    --s4: #c98500;
+    --s5: #d55181;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #14161a;
+  --ink: #e6e8eb;
+  --ink-2: #c2c7cd;
+  --muted: #969ea8;
+  --rule: #30353c;
+  --rule-strong: #d3d7dc;
+  --tint: #1c1f24;
+  --accent: #8db4e8;
+  --accent-soft: #1d2a3b;
+  --ar: #272b32;
+  --bar-base: #1c5cab;
+  --bar-range: #6da7ec;
+  --bar-muted-base: #49505a;
+  --bar-muted-range: #9aa2ab;
+  --s1: #3987e5;
+  --s2: #d95926;
+  --s3: #199e70;
+  --s4: #c98500;
+  --s5: #d55181;
+  color-scheme: dark;
+}
+
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-serif);
+  font-size: 1.0625rem;
+  line-height: 1.95;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 5rem;
+}
+
+/* 本文の段と、張り出す図表 */
+.paper > header > *,
+.paper > section > * { max-width: var(--measure); margin-inline: auto; }
+.paper > section > .wide { max-width: var(--wide); }
+
+p { margin-block: 0 1em; text-align: justify; text-justify: inter-character; }
+ul, ol { margin-block: 0 1em; padding-left: 1.5em; }
+li { margin-bottom: .35em; }
+li::marker { color: var(--muted); }
+strong { font-weight: 700; }
+
+/* 標題 */
+.masthead { padding-block: 3.4rem 0; }
+.kind { font-family: var(--font-sans); font-size: .8rem; letter-spacing: .14em; color: var(--muted); margin-bottom: .6rem; }
+h1 { font-family: var(--font-serif); font-weight: 700; font-size: clamp(1.5rem, 4.4vw, 2.15rem); line-height: 1.45; margin-block: 0 .5rem; text-wrap: balance; word-break: keep-all; overflow-wrap: anywhere; }
+.subtitle { font-size: 1.02rem; line-height: 1.7; color: var(--ink-2); margin-bottom: .9rem; text-align: left; }
+.entitle { font-size: .9rem; line-height: 1.6; color: var(--muted); margin-bottom: .8rem; text-align: left; }
+.dateline { font-family: var(--font-sans); font-size: .8rem; color: var(--muted); }
+
+/* 要旨 */
+.abstract { border-top: 1.5px solid var(--rule-strong); border-bottom: 1px solid var(--rule); padding-block: 1rem .3rem; margin-top: 1.6rem; }
+.abstract h2 { font-family: var(--font-sans); font-size: .9rem; letter-spacing: .1em; margin: 0 0 .5rem; }
+.abstract p { font-size: .97rem; line-height: 1.9; }
+.keywords { font-family: var(--font-sans); font-size: .82rem; line-height: 1.7; color: var(--ink-2); text-align: left; }
+.keywords b { margin-right: .5em; }
+.abstract-en { margin-top: .6rem; }
+.abstract-en p { font-size: .88rem; line-height: 1.7; text-align: left; color: var(--ink-2); }
+
+/* 見出し */
+h2 { font-family: var(--font-sans); font-weight: 700; font-size: 1.24rem; line-height: 1.5; margin-block: 3.2rem 1rem; text-wrap: balance; }
+h3 { font-family: var(--font-sans); font-weight: 700; font-size: 1.02rem; line-height: 1.55; margin-block: 2.1rem .6rem; text-wrap: balance; }
+h2 .num, h3 .num { display: inline-block; min-width: 1.8em; }
+
+code { font-family: var(--font-mono); font-size: .85em; overflow-wrap: anywhere; }
+p code, li code { word-break: break-all; }
+pre { font-family: var(--font-mono); font-size: .78rem; line-height: 1.65; background: var(--tint); color: var(--ink); padding: .9rem 1rem; overflow-x: auto; border-radius: 4px; margin-block: 0 1.2rem; }
+pre code { font-size: 1em; overflow-wrap: normal; }
+var { font-family: Georgia, "Times New Roman", serif; font-style: italic; }
+
+/* 式 */
+.eq { display: grid; grid-template-columns: 1fr auto 1fr; align-items: baseline; margin-block: .4rem 1.2rem; font-size: 1.04rem; }
+.eq .f { grid-column: 2; white-space: nowrap; }
+.eq .no { grid-column: 3; justify-self: end; font-family: var(--font-sans); font-size: .82rem; color: var(--muted); }
+.eq sub { font-family: var(--font-sans); font-size: .62em; font-style: normal; }
+
+/* 表 */
+.tbl { overflow-x: auto; margin-block: 1.6rem 1.8rem; }
+table { border-collapse: collapse; width: 100%; font-family: var(--font-sans); font-size: .82rem; line-height: 1.6; font-variant-numeric: tabular-nums; }
+caption { caption-side: top; text-align: left; font-size: .84rem; line-height: 1.65; padding-bottom: .5rem; color: var(--ink); }
+caption b, figcaption b { margin-right: .7em; color: var(--ink); }
+thead th { border-top: 1.5px solid var(--rule-strong); border-bottom: 1px solid var(--rule-strong); font-weight: 700; vertical-align: bottom; }
+th, td { padding: .4rem .6rem; text-align: left; vertical-align: top; }
+tbody td, tbody th { border-bottom: 1px solid var(--rule); }
+tbody tr:last-child td, tbody tr:last-child th { border-bottom: 1.5px solid var(--rule-strong); }
+tbody th { font-weight: 500; }
+th { white-space: nowrap; }
+.n { text-align: right; white-space: nowrap; }
+tr.em td, tr.em th { font-weight: 700; }
+.tnote { font-family: var(--font-sans); font-size: .76rem; line-height: 1.65; color: var(--muted); margin-top: .5rem; text-align: left; }
+
+/* 図 */
+figure { margin-block: 2rem 2.2rem; }
+.fig-scroll { overflow-x: auto; }
+figure svg { display: block; width: 100%; height: auto; min-width: 40rem; color: var(--ink); }
+figure.chart svg { min-width: 36rem; }
+figcaption { font-family: var(--font-sans); font-size: .82rem; line-height: 1.7; color: var(--ink-2); margin-top: .6rem; }
+svg text { font-family: var(--font-sans); }
+svg .mono { font-family: var(--font-mono); }
+svg .halo { paint-order: stroke; stroke: var(--paper); stroke-width: 4px; stroke-linejoin: round; }
+
+/* 引用・注・文献 */
+a { color: var(--accent); text-decoration-thickness: .06em; text-underline-offset: .18em; }
+.cite { font-family: var(--font-sans); font-size: .84em; white-space: nowrap; }
+.cite a { text-decoration: none; }
+a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+sup.fn { font-family: var(--font-sans); font-size: .7em; line-height: 0; }
+sup.fn a { text-decoration: none; }
+.notes ol, .refs ol { list-style: none; padding: 0; margin: 0; font-family: var(--font-sans); font-size: .8rem; line-height: 1.65; }
+.notes li, .refs li { display: grid; grid-template-columns: 2.6em minmax(0, 1fr); column-gap: .3em; margin-bottom: .5rem; }
+.notes .rn, .refs .rn { color: var(--muted); font-variant-numeric: tabular-nums; }
+.refs a, .notes a { overflow-wrap: anywhere; }
+.refs .t { font-weight: 500; }
+:target { scroll-margin-top: 1.5rem; }
+li:target .rn, li:target { background: var(--accent-soft); }
+
+/* 図の上の数値の吹き出し */
+.tip { position: fixed; z-index: 20; pointer-events: none; max-width: 19rem; background: var(--ink); color: var(--paper); font-family: var(--font-sans); font-size: .78rem; line-height: 1.55; padding: .35rem .55rem; border-radius: 4px; box-shadow: 0 2px 10px rgba(0, 0, 0, .2); }
+[data-tip] { cursor: default; }
+[data-tip]:focus { outline: none; }
+[data-tip]:focus-visible { stroke: var(--ink); stroke-width: 2px; }
+
+footer.colophon { font-family: var(--font-sans); font-size: .78rem; color: var(--muted); border-top: 1px solid var(--rule); padding-top: 1rem; margin-top: 3rem; }
+
+@media (max-width: 560px) {
+  body { font-size: 1rem; line-height: 1.9; }
+  p { text-align: left; }
+  h2 { margin-top: 2.6rem; }
+}
+@media print {
+  body { background: #fff; color: #000; }
+  .tip { display: none !important; }
+  figure, .tbl, pre, .eq { break-inside: avoid; }
+  a { color: inherit; text-decoration: none; }
+}
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+</head>
+<body>
+<article class="paper">
+
+<header class="masthead">
+  <div class="kind">技術報告</div>
+  <h1>8 台の DGX Spark による<wbr>分散推論環境での<wbr> vLLM 性能チューニング</h1>
+  <p class="subtitle">DeepSeek-V4.1-Flash のデコードを、カーネル選択・one-shot RDMA all-reduce・通信待ちの L2 先読みで 2.3 倍にする</p>
+  <p class="entitle">Performance Tuning of vLLM on an Eight-Node DGX Spark Cluster: A 2.3× Faster Decode for DeepSeek-V4.1-Flash through Kernel Selection, One-Shot RDMA All-Reduce, and L2 Prefetching during Communication</p>
+  <div class="dateline">2026年10月</div>
+
+  <div class="abstract">
+    <h2>要旨</h2>
+    <p>本稿では、CPU と GPU がメモリを共有する NVIDIA DGX Spark（GB10）8 台を 200 Gb/s の RoCE v2 で結んだ環境で、vLLM によるテンソル並列（TP=8）推論のデコードを高速化した結果を報告する。対象は 384 個のエキスパートを持つ Mixture-of-Experts（MoE）モデル DeepSeek-V4.1-Flash-1017（重み 510.3 GB）で、投機的デコーディング（DSpark、5 トークンの提案）を併用する。既定の構成では、GPU は 1 ステップの時間の 98〜99% でカーネルを実行しており、その多くを、テンソル並列で細分化されて低い実効帯域でしか動かない行列積と、1 ステップ 94 回の集団通信（all-reduce 88 回と all-gather 6 回）が占めていた。本稿では、(1) 重みだけを低ビットで持つ行列積カーネル（Marlin）への切り替えと、分割で生じたゼロパディングの削除、(2) CPU プロキシ型の one-shot RDMA all-reduce の vLLM への組み込み、(3) all-reduce と attention の待ち時間に、次に読む重みを別のストリームで L2 キャッシュへ読み込む先読み、(4) 投機ドラフトの固定費の削減、を行った。短いプロンプトでの単一ストリームのデコード（思考なし、温度 0、600 トークン）の 1 ステップは 60.6〜63.9 ms から 26.1〜27.7 ms に縮み（2.3 倍）、温度 0 の出力検査、並行時の正答、約 49 万トークンまでの needle 試験、HumanEval+/MBPP+、90 分の連続負荷のいずれでも、品質と安定性の低下は見られなかった。あわせて、CPU・GPU・NIC が同じ LPDDR5X を使う GB10 では、先読みの DRAM 読み出しと並ぶ RDMA all-reduce が 1 回あたり約 10 µs 延びることを単体測定で示し、通信と重ねる先読みが得になる条件を示す。</p>
+    <p class="keywords"><b>キーワード</b>大規模言語モデル推論、vLLM、テンソル並列、Mixture-of-Experts、投機的デコーディング、RDMA all-reduce、L2 キャッシュ先読み、統合メモリ</p>
+    <div class="abstract-en">
+      <p><b>Abstract.</b> We accelerate tensor-parallel (TP=8) decoding in vLLM on eight NVIDIA DGX Spark (GB10) systems, whose CPU and GPU share one memory, connected by 200 Gb/s RoCE v2. The workload is DeepSeek-V4.1-Flash-1017, a 384-expert mixture-of-experts model with 510.3 GB of weights, served with DSpark speculative decoding (five draft tokens). With the default configuration the GPU was busy for 98–99% of each step, and most of that time went to TP-sharded matrix multiplications running far below memory bandwidth and to 94 collective operations per step (88 all-reduces and 6 all-gathers). We (1) switch to weight-only low-bit GEMM kernels (Marlin) and remove zero padding introduced by sharding, (2) integrate a CPU-proxied one-shot RDMA all-reduce into vLLM, (3) prefetch the weights needed next into the L2 cache on a separate stream while all-reduce and attention wait, and (4) cut fixed costs on the draft side. For short prompts (no thinking, greedy, 600 tokens) the single-stream decode step falls from 60.6–63.9 ms to 26.1–27.7 ms (2.3×), with no regression in greedy-output checks, concurrent correctness, needle tests up to about 490K tokens, HumanEval+/MBPP+, or a 90-minute soak test. We also measure that on GB10, where the CPU, GPU and NIC share one LPDDR5X memory, concurrent prefetch reads lengthen each RDMA all-reduce by about 10 µs, which we attribute, without direct verification, to the CPU, GPU and NIC sharing that LPDDR5X, and derive when overlapping prefetch with communication pays off.</p>
+    </div>
+  </div>
+</header>
+
+<section id="s1">
+  <h2><span class="num">1</span>はじめに</h2>
+  <p>大規模言語モデル（LLM）をエージェントとして用いるソフトウェア開発では、モデルがファイルの読み書きやテストの実行といったツール呼び出しを繰り返しながら、長い出力を生成する<span class="cite">[<a href="#ref-1">1</a>, <a href="#ref-2">2</a>]</span>。利用者が一人の環境では、同時に処理する要求は主エージェントとサブエージェントを合わせて 1〜4 本程度であり、集約スループットよりも 1 本あたりのデコードの速さが待ち時間を決める。</p>
+  <p>NVIDIA DGX Spark は GB10 SoC を搭載し、CPU と GPU が 128 GB の LPDDR5X を共有する小型機である<span class="cite">[<a href="#ref-3">3</a>, <a href="#ref-4">4</a>]</span>。1 台では数百 GB の MoE モデルを保持できないため、本環境では 8 台を RoCE v2（RDMA over Converged Ethernet。RDMA は remote direct memory access）で結び、vLLM<span class="cite">[<a href="#ref-5">5</a>]</span> のテンソル並列（TP）<span class="cite">[<a href="#ref-6">6</a>]</span> で 1 つのモデルを分割して実行する。小さいバッチのデコードでは、各 rank が毎ステップ自分の担当する重みをメモリから読み出すので、時間はメモリ帯域で下から抑えられる<span class="cite">[<a href="#ref-7">7</a>, <a href="#ref-8">8</a>]</span>。さらに TP では層ごとに all-reduce が入り、ノード間の小さなメッセージの遅延が積み重なる。</p>
+  <p>本稿の対象である DeepSeek-V4.1-Flash-1017<span class="cite">[<a href="#ref-9">9</a>, <a href="#ref-10">10</a>]</span><sup class="fn"><a href="#fn1" id="fnref1">1</a></sup> を vLLM の既定の構成で動かすと、投機的デコーディングの 1 ステップ（直前の確定トークンと 5 個の提案の計 6 行の検証と、ドラフトの生成）に 60.6〜63.9 ms を要した。後述のとおり、この時間はほぼすべて GPU 上の計算と通信であり、ホスト側の待ちは無い。したがって、高速化には GPU 上の時間そのものを減らす必要がある。本稿の貢献は次のとおりである。</p>
+  <ol>
+    <li>GB10 8 台での小バッチ MoE デコードの性能を、プロファイルと単体測定で分析し、時間の内訳と、帯域・通信から見た下限を示す（3 章）。</li>
+    <li>小さいバッチ向けの行列積カーネルを選び、TP 分割で生じるゼロパディングと形の不整合を解消する（4.1〜4.3 節）。</li>
+    <li>CPU プロキシ型の one-shot RDMA all-reduce のコミュニティによる組み込みを upstream の vLLM に移植し、CUDA グラフの取り込み中だけ RDMA に回す 2 段階の有効化と毎ステップの fence を加えて、CUDA グラフでの使用と、障害時に壊れた出力を返さず停止する性質（fail-stop）を両立させる設計にする（4.4 節）。</li>
+    <li>all-reduce と attention の待ち時間に次の重みを L2 キャッシュへ読み込む先読みを実装し、統合メモリでの通信との干渉を測って、適用の設計則を与える（4.5 節）。</li>
+    <li>投機ドラフトの固定費を、目標モデルの出力を変えずに削減する（4.6 節）。</li>
+  </ol>
+  <p>これらは vLLM の Python 層への 9 件の修正（17 ファイル、追加 1,875 行・削除 27 行）と起動設定だけで実現しており、それぞれ環境変数で切り替えられる。短いプロンプトでの単一ストリームのデコードは 2.3 倍になり、品質と安定性の評価で低下は見られなかった（5 章）。</p>
+</section>
+
+<section id="s2">
+  <h2><span class="num">2</span>対象システム</h2>
+
+  <h3><span class="num">2.1</span>ハードウェア</h3>
+  <p>各ノードの GB10 は、Blackwell 世代の GPU（compute capability 12.1<span class="cite">[<a href="#ref-11">11</a>]</span>、CUDA コア 6,144<span class="cite">[<a href="#ref-3">3</a>]</span> の 48 SM（streaming multiprocessor）、L2 キャッシュ 24 MB<span class="cite">[<a href="#ref-4">4</a>]</span>）と 20 コアの Arm CPU<span class="cite">[<a href="#ref-3">3</a>]</span> を 1 つの SoC に載せる。両者は 256 ビット幅の LPDDR5X（128 GB、公称 273 GB/s<span class="cite">[<a href="#ref-3">3</a>]</span>）を、ハードウェアのコヒーレンスを保って共有する<span class="cite">[<a href="#ref-4">4</a>]</span>。ネットワークカードの ConnectX-7 も PCIe Gen5 x8 で SoC につながり<span class="cite">[<a href="#ref-4">4</a>]</span>、DMA で同じメモリを読み書きする。以下では、compute capability 12.x の GPU をまとめて SM12x と書く。推論を止めた状態で測った 2 GiB のコピー（読み出しと書き込み）は 224 GB/s であった。</p>
+  <p>ConnectX-7 の物理ポート 0 は、OS からは PCIe Gen5 x4 の論理 NIC 2 つに見える。本環境ではこれを別サブネットの 2 本のレール（Rail A・B）とし、400G ポートを 2×200G に分けるブレイクアウト DAC（direct attach copper。1 本で 2 台、8 台で計 4 本）で、各ノードを MikroTik CRS804-4DDQ に収容した（図 1）。RDMA の基礎性能は、ib_write_bw（双方向、4 QP（queue pair））が 1 レールあたり 222.1〜222.8 Gb/s、両レール同時で 391.47 Gb/s、ib_write_lat（2 バイト）が 2.53〜3.06 µs である。PFC（priority flow control）と ECN（explicit congestion notification）は設定していない。DGX Spark は GPUDirect RDMA<span class="cite">[<a href="#ref-12">12</a>]</span> に対応しない<span class="cite">[<a href="#ref-13">13</a>]</span>ため、NCCL の GPU 主導の通信や NVSHMEM の IBGDA（InfiniBand GPUDirect Async）<span class="cite">[<a href="#ref-14">14</a>]</span> は使えない。プロセスの制御（Ray・Gloo）は別の 10GbE 網を通す。構成を表 1 にまとめる。</p>
+
+  <figure class="wide" id="fig1">
+    <div class="fig-scroll"><svg viewBox="0 0 960 420" role="img" aria-label="システムの構成。各ノードでは GPU・CPU・NIC が 1 つの LPDDR5X を共有し、8 ノードが CRS804-4DDQ を介して 200 Gb/s の RoCE で結ばれる。"><defs><marker id="ah-sys" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs><text x="20.0" y="28.0" font-size="13" text-anchor="start" font-weight="700" style="fill:var(--ink-2)">1 ノードの中</text><rect x="20.0" y="40.0" width="370.0" height="366.0" rx="8" style="fill:none;stroke:var(--rule-strong);stroke-width:1.2"/><text x="34.0" y="62.0" font-size="12" text-anchor="start" style="fill:var(--muted)">DGX Spark（TP の 1 rank）</text><rect x="36.0" y="74.0" width="338.0" height="112.0" rx="6" style="fill:var(--paper);stroke:var(--ink-2);stroke-width:1"/><text x="48.0" y="94.0" font-size="12" text-anchor="start" font-weight="700" style="fill:var(--ink)">GB10 SoC</text><rect x="48.0" y="104.0" width="168.0" height="70.0" rx="4" style="fill:var(--tint);stroke:var(--rule);stroke-width:1"/><text x="60.0" y="127.0" font-size="12.5" text-anchor="start" font-weight="700" style="fill:var(--ink)">GPU（sm_121）</text><text x="60.0" y="147.0" font-size="12" text-anchor="start" style="fill:var(--ink)">48 SM・L2 24 MB</text><text x="60.0" y="164.0" font-size="11" text-anchor="start" style="fill:var(--muted)">Marlin・RDMA のカーネル</text><rect x="228.0" y="104.0" width="134.0" height="70.0" rx="4" style="fill:var(--tint);stroke:var(--rule);stroke-width:1"/><text x="240.0" y="127.0" font-size="12.5" text-anchor="start" font-weight="700" style="fill:var(--ink)">CPU（Arm 20 コア）</text><text x="240.0" y="147.0" font-size="12" text-anchor="start" style="fill:var(--ink)">RDMA の</text><text x="240.0" y="164.0" font-size="12" text-anchor="start" style="fill:var(--ink)">プロキシスレッド</text><rect x="36.0" y="236.0" width="338.0" height="58.0" rx="6" style="fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.5"/><text x="205.0" y="260.0" font-size="13" text-anchor="middle" font-weight="700" style="fill:var(--ink)">LPDDR5X 128 GB（統合メモリ）</text><text x="205.0" y="280.0" font-size="12" text-anchor="middle" style="fill:var(--ink)">公称 273 GB/s・コピーの実測 224 GB/s</text><rect x="36.0" y="336.0" width="338.0" height="56.0" rx="6" style="fill:var(--tint);stroke:var(--rule);stroke-width:1"/><text x="205.0" y="359.0" font-size="13" text-anchor="middle" font-weight="700" style="fill:var(--ink)">ConnectX-7</text><text x="205.0" y="378.0" font-size="12" text-anchor="middle" style="fill:var(--ink)">PCIe Gen5 x8 → 論理 NIC 2 つ（Rail A・B）</text><line x1="132.0" y1="177.0" x2="132.0" y2="233.0" style="stroke:var(--ink-2);stroke-width:1.3" marker-start="url(#ah-sys)" marker-end="url(#ah-sys)"/><text x="140.0" y="210.0" font-size="11" text-anchor="start" style="fill:var(--muted)">重み・活性</text><line x1="295.0" y1="177.0" x2="295.0" y2="233.0" style="stroke:var(--ink-2);stroke-width:1.3" marker-start="url(#ah-sys)" marker-end="url(#ah-sys)"/><text x="303.0" y="210.0" font-size="11" text-anchor="start" style="fill:var(--muted)">送信の指示</text><line x1="205.0" y1="297.0" x2="205.0" y2="333.0" style="stroke:var(--ink-2);stroke-width:1.3" marker-start="url(#ah-sys)" marker-end="url(#ah-sys)"/><text x="213.0" y="319.0" font-size="11" text-anchor="start" style="fill:var(--muted)">DMA（RDMA の送受信）</text><text x="440.0" y="28.0" font-size="13" text-anchor="start" font-weight="700" style="fill:var(--ink-2)">8 ノードの RoCE ファブリック</text><rect x="620.0" y="150.0" width="150.0" height="110.0" rx="6" style="fill:var(--tint);stroke:var(--ink-2);stroke-width:1.2"/><text x="695.0" y="190.0" font-size="13" text-anchor="middle" font-weight="700" style="fill:var(--ink)">CRS804-4DDQ</text><text x="695.0" y="212.0" font-size="11.5" text-anchor="middle" style="fill:var(--ink)">400G ×4 を</text><text x="695.0" y="229.0" font-size="11.5" text-anchor="middle" style="fill:var(--ink)">200G ×8 に分割</text><rect x="440.0" y="60.0" width="110.0" height="44.0" rx="4" style="fill:var(--paper);stroke:var(--ink-2);stroke-width:1"/><text x="495.0" y="79.0" font-size="12" text-anchor="middle" font-weight="700" style="fill:var(--ink)">ノード 0（head）</text><text x="495.0" y="95.0" font-size="11" text-anchor="middle" style="fill:var(--muted)">TP rank 0</text><line x1="550.0" y1="82.0" x2="620.0" y2="170.0" style="stroke:var(--ink-2);stroke-width:1.2"/><rect x="440.0" y="140.0" width="110.0" height="44.0" rx="4" style="fill:var(--paper);stroke:var(--ink-2);stroke-width:1"/><text x="495.0" y="159.0" font-size="12" text-anchor="middle" font-weight="700" style="fill:var(--ink)">ノード 1</text><text x="495.0" y="175.0" font-size="11" text-anchor="middle" style="fill:var(--muted)">TP rank 1</text><line x1="550.0" y1="162.0" x2="620.0" y2="190.0" style="stroke:var(--ink-2);stroke-width:1.2"/><rect x="440.0" y="220.0" width="110.0" height="44.0" rx="4" style="fill:var(--paper);stroke:var(--ink-2);stroke-width:1"/><text x="495.0" y="239.0" font-size="12" text-anchor="middle" font-weight="700" style="fill:var(--ink)">ノード 2</text><text x="495.0" y="255.0" font-size="11" text-anchor="middle" style="fill:var(--muted)">TP rank 2</text><line x1="550.0" y1="242.0" x2="620.0" y2="210.0" style="stroke:var(--ink-2);stroke-width:1.2"/><rect x="440.0" y="300.0" width="110.0" height="44.0" rx="4" style="fill:var(--paper);stroke:var(--ink-2);stroke-width:1"/><text x="495.0" y="319.0" font-size="12" text-anchor="middle" font-weight="700" style="fill:var(--ink)">ノード 3</text><text x="495.0" y="335.0" font-size="11" text-anchor="middle" style="fill:var(--muted)">TP rank 3</text><line x1="550.0" y1="322.0" x2="620.0" y2="230.0" style="stroke:var(--ink-2);stroke-width:1.2"/><rect x="840.0" y="60.0" width="110.0" height="44.0" rx="4" style="fill:var(--paper);stroke:var(--ink-2);stroke-width:1"/><text x="895.0" y="79.0" font-size="12" text-anchor="middle" font-weight="700" style="fill:var(--ink)">ノード 4</text><text x="895.0" y="95.0" font-size="11" text-anchor="middle" style="fill:var(--muted)">TP rank 4</text><line x1="840.0" y1="82.0" x2="770.0" y2="170.0" style="stroke:var(--ink-2);stroke-width:1.2"/><rect x="840.0" y="140.0" width="110.0" height="44.0" rx="4" style="fill:var(--paper);stroke:var(--ink-2);stroke-width:1"/><text x="895.0" y="159.0" font-size="12" text-anchor="middle" font-weight="700" style="fill:var(--ink)">ノード 5</text><text x="895.0" y="175.0" font-size="11" text-anchor="middle" style="fill:var(--muted)">TP rank 5</text><line x1="840.0" y1="162.0" x2="770.0" y2="190.0" style="stroke:var(--ink-2);stroke-width:1.2"/><rect x="840.0" y="220.0" width="110.0" height="44.0" rx="4" style="fill:var(--paper);stroke:var(--ink-2);stroke-width:1"/><text x="895.0" y="239.0" font-size="12" text-anchor="middle" font-weight="700" style="fill:var(--ink)">ノード 6</text><text x="895.0" y="255.0" font-size="11" text-anchor="middle" style="fill:var(--muted)">TP rank 6</text><line x1="840.0" y1="242.0" x2="770.0" y2="210.0" style="stroke:var(--ink-2);stroke-width:1.2"/><rect x="840.0" y="300.0" width="110.0" height="44.0" rx="4" style="fill:var(--paper);stroke:var(--ink-2);stroke-width:1"/><text x="895.0" y="319.0" font-size="12" text-anchor="middle" font-weight="700" style="fill:var(--ink)">ノード 7</text><text x="895.0" y="335.0" font-size="11" text-anchor="middle" style="fill:var(--muted)">TP rank 7</text><line x1="840.0" y1="322.0" x2="770.0" y2="230.0" style="stroke:var(--ink-2);stroke-width:1.2"/><text x="695.0" y="130.0" font-size="11" text-anchor="middle" style="fill:var(--muted)">各ノード 200 Gb/s（Rail A・B）</text><text x="695.0" y="400.0" font-size="11" text-anchor="middle" style="fill:var(--muted)">プロセスの制御（Ray・Gloo）は別の 10GbE 網</text></svg></div>
+    <figcaption><b>図 1</b>システムの構成。左は 1 ノードの内部で、GPU・CPU・NIC が 1 つの LPDDR5X を読み書きする。右は 8 ノードの RoCE ファブリックで、各ノードが TP の 1 rank を受け持つ。</figcaption>
+  </figure>
+
+  <div class="tbl wide">
+    <table>
+      <caption><b>表 1</b>ハードウェアとソフトウェアの構成</caption>
+      <thead><tr><th>項目</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><th>ノード</th><td>NVIDIA DGX Spark × 8（1 ノード 1 GPU、TP の 1 rank）</td></tr>
+        <tr><th>SoC</th><td>NVIDIA GB10。GPU は sm_121・48 SM・L2 24 MB、CPU は Arm 20 コア（Cortex-X925 ×10、Cortex-A725 ×10）</td></tr>
+        <tr><th>メモリ</th><td>LPDDR5X 128 GB を CPU・GPU・NIC で共有（256 ビット、公称 273 GB/s、コピーの実測 224 GB/s）</td></tr>
+        <tr><th>NIC</th><td>ConnectX-7。物理ポート 0 を PCIe Gen5 x4 の論理 NIC 2 つ（Rail A・B）として使用、MTU 9000</td></tr>
+        <tr><th>スイッチ</th><td>MikroTik CRS804-4DDQ（400G QSFP56-DD ×4 をブレイクアウト DAC で 2×200G に分割）。RoCE v2、PFC・ECN なし</td></tr>
+        <tr><th>RDMA の実測</th><td>ib_write_bw（双方向・4 QP）1 レール 222.1〜222.8 Gb/s、両レール同時 391.47 Gb/s。ib_write_lat（2 バイト）2.53〜3.06 µs</td></tr>
+        <tr><th>制御網</th><td>10GbE（Ray・Gloo・監視）</td></tr>
+        <tr><th>ソフトウェア</th><td>DGX OS（Linux 6.17.0-1029-nvidia）、NVIDIA ドライバ 580.173.02、CUDA 13.0、vLLM 0.32.1rc1.dev36（nightly、コミット e68efc685）、FlashInfer 0.7.2、PyTorch 2.14（cu130）、NCCL 2.30.7、Ray</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3><span class="num">2.2</span>モデル</h3>
+  <p>DeepSeek-V4.1-Flash-1017<span class="cite">[<a href="#ref-10">10</a>]</span> は DeepSeek-V4 系<span class="cite">[<a href="#ref-15">15</a>]</span>の MoE モデルで、40 層の各層が attention と MoE を持つ（表 2）。MoE は 384 個のルーティングされるエキスパートから上位 6 個を選び、共有エキスパートを併用する<span class="cite">[<a href="#ref-16">16</a>]</span>。attention は DeepSeek-V4 の CSA（compressed sparse attention）を発展させた CSA2<span class="cite">[<a href="#ref-9">9</a>]</span> で、系列方向に圧縮した KV を全ヘッドで共有し、indexer で選んだ上位のトークン<span class="cite">[<a href="#ref-17">17</a>]</span>にだけ注意を向ける。CSA2 は KV と上位トークンの選択を層の間で共有し<span class="cite">[<a href="#ref-9">9</a>]</span>、indexer と KV 圧縮器の少なくとも一方を持つのは 40 層のうち 8 層である。vLLM と FlashInfer では sparse MLA（multi-head latent attention）のカーネルで動く。残差の流れは mHC（manifold-constrained hyper-connections）<span class="cite">[<a href="#ref-18">18</a>, <a href="#ref-19">19</a>]</span> で 4 系統に広げて層ごとに混合し、層 1 と 14 は参照専用の表 Engram<span class="cite">[<a href="#ref-20">20</a>]</span> を引く。重みは、dense の線形層が FP8 e4m3（32×32 のブロックごとに 2 の冪のスケール）<span class="cite">[<a href="#ref-21">21</a>]</span>、ルーティングされるエキスパートが MXFP4（32 要素ごとのスケール）<span class="cite">[<a href="#ref-22">22</a>, <a href="#ref-23">23</a>]</span>で、合計 510.3 GB である<sup class="fn"><a href="#fn1" id="fnref1b">1</a></sup>。</p>
+  <p>投機的デコーディング<span class="cite">[<a href="#ref-24">24</a>, <a href="#ref-25">25</a>]</span>には、チェックポイントに同梱された DSpark<span class="cite">[<a href="#ref-26">26</a>]</span> のドラフト（3 層、128 エキスパート）を使う。DSpark は目標モデルの 3 層分の隠れ状態を射影（<code>main_proj</code>）してドラフトの層に入れ、ドラフトの基底ロジットに、直前のトークンから計算する Markov 補正を加えて提案を 1 つずつ作る。本稿では提案数を k=5 とし、目標モデルは 1 ステップで 6 行（直前の確定トークンと 5 個の提案）を検証する。</p>
+
+  <div class="tbl wide">
+    <table>
+      <caption><b>表 2</b>モデルの構成と、TP=8 での rank あたりの主なテンソル</caption>
+      <thead><tr><th>(a) 項目</th><th>値</th></tr></thead>
+      <tbody>
+        <tr><th>層</th><td>40（各層に attention と MoE）＋ドラフト 3 層</td></tr>
+        <tr><th>隠れ次元</th><td>5120</td></tr>
+        <tr><th>MoE</th><td>ルーティングされるエキスパート 384・上位 6、共有エキスパートあり。中間次元 2304（TP=8 で rank あたり 288）</td></tr>
+        <tr><th>attention</th><td>CSA2（圧縮した KV を全ヘッドで共有する sparse attention）。indexer・KV 圧縮器を持つ層は 8</td></tr>
+        <tr><th>層間の混合・参照表</th><td>mHC（4 系統）、Engram（層 1・14、計 203.1 GB）</td></tr>
+        <tr><th>投機</th><td>DSpark（3 層・128 エキスパート）。本稿では k=5</td></tr>
+        <tr><th>重みの形式と合計</th><td>dense は FP8 e4m3、ルーティングされるエキスパートは MXFP4。計 510.3 GB</td></tr>
+        <tr><th>最大文脈長</th><td>1M（本稿の運用は 524,288）</td></tr>
+      </tbody>
+    </table>
+    <table style="margin-top:1.2rem">
+      <thead><tr><th>(b) テンソル（rank あたり）</th><th class="n">大きさ</th></tr></thead>
+      <tbody>
+        <tr><td><code>wq_a</code>+<code>wkv</code>（FP8、全 rank に複製、1 層）</td><td class="n">9.2 MB</td></tr>
+        <tr><td><code>wq_b</code>（FP8、1 層）</td><td class="n">5.2 MB</td></tr>
+        <tr><td><code>wo_a</code>／<code>wo_b</code>（FP8、1 層）</td><td class="n">4.2／5.2 MB</td></tr>
+        <tr><td>ルーター（BF16、全 rank に複製、1 層）</td><td class="n">3.9 MB</td></tr>
+        <tr><td>mHC 係数（FP32、2 組、全 rank に複製、1 層）</td><td class="n">3.9 MB</td></tr>
+        <tr><td>ルーティングされるエキスパート 1 個（MXFP4＋スケール、パディング前）</td><td class="n">2.35 MB</td></tr>
+        <tr><td><code>lm_head</code>（BF16、語彙を 8 分割）</td><td class="n">165 MB</td></tr>
+        <tr><td>ドラフトの <code>main_proj</code>（FP8、全 rank に複製）</td><td class="n">78.6 MB</td></tr>
+        <tr><td>重みの合計（Engram 約 23.6 GiB を含む、構成 D）</td><td class="n">62.2 GiB</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3><span class="num">2.3</span>vLLM の実行構成</h3>
+  <p>推論エンジンは vLLM の nightly（0.32.1rc1.dev36）で、FlashInfer 0.7.2<span class="cite">[<a href="#ref-27">27</a>]</span> を含む。GB10（sm_121）で本モデルを正しく動かすため、upstream に出された 3 件の修正（PR。sparse attention のカーネルブロック、DSpark と CUDA グラフの組み合わせ、プロンプトのエンコーダ。付録 A）を加えた。TP=8 で各ノードに 1 rank を置き、Ray<span class="cite">[<a href="#ref-28">28</a>]</span> でワーカーを起動する。V2 のモデルランナーを用い、デコードは CUDA グラフ<span class="cite">[<a href="#ref-29">29</a>]</span> で再生する。KV キャッシュは FP8（<code>fp8_ds_mla</code>）、ブロックサイズは 64、最大文脈長は 524,288 トークンで、prefix caching を有効にした。</p>
+  <p>TP=8 では、各層の attention の出力と MoE の出力でそれぞれ all-reduce が要る。目標モデルの 80 回にドラフトの層などの分が加わって、1 ステップの all-reduce は 88 回になり、ほかに all-gather が 6 回ある（既定の構成。集団通信は計 94 回）。k=5 の検証 1 本あたりのメッセージは 60 KiB（6 行 × 5120 × BF16）である。また、統合メモリでは GPU 側の確保がそのままホストの空きを減らし、確保が失敗しないので、PyTorch のキャッシュアロケータが確保の失敗を契機にキャッシュを手放すこともない。長い prefill では文脈長に応じて大きさの変わる一時領域が再利用されずに積み上がり、ホストのメモリを圧迫するため、アロケータに <code>expandable_segments</code> を指定する。</p>
+</section>
+
+<section id="s3">
+  <h2><span class="num">3</span>測定方法と既定構成の分析</h2>
+
+  <h3><span class="num">3.1</span>指標</h3>
+  <p>投機的デコーディングでは、1 ステップで確定するトークン数（受理長）が出力の中身で変わる。そこで、デコードの時間 <var>T</var><sub>dec</sub> を、検証のステップ数 <var>N</var><sub>step</sub> で割った 1 ステップの時間 <var>t</var><sub>step</sub> を主な指標とする。受理長 <var>τ</var> は確定したトークン数 <var>N</var><sub>tok</sub> から求める。</p>
+  <div class="eq"><span class="f"><var>t</var><sub>step</sub> = <var>T</var><sub>dec</sub> / <var>N</var><sub>step</sub>,　<var>τ</var> = <var>N</var><sub>tok</sub> / <var>N</var><sub>step</sub></span><span class="no">(1)</span></div>
+  <p>1 本の要求の生成速度（tok/s）は次式で決まる。</p>
+  <div class="eq"><span class="f">生成速度 = <var>τ</var> / <var>t</var><sub>step</sub></span><span class="no">(2)</span></div>
+  <p>カーネルを替えると数値誤差で温度 0 の出力が途中から分岐し、<var>τ</var> が変わる。実際、行列積のカーネルを Marlin に替えると、コードの続き書きの <var>τ</var> は 3.55 から 5.94 に変わった（5.2 節の構成 A と B。dense だけを Marlin にした構成でも 5.94）。式 (2) のとおり tok/s は <var>τ</var> にも比例するので、この変化はカーネルの速さと区別できない。そのため構成の比較には式 (1) の <var>t</var><sub>step</sub> を使い、tok/s は参考として併記する。<var>N</var><sub>step</sub> は vLLM の <code>/metrics</code> が出す <code>vllm:spec_decode_num_drafts_total</code> の、要求の前後での差から得る。</p>
+
+  <h3><span class="num">3.2</span>測定条件</h3>
+  <p><var>t</var><sub>step</sub> は、同じ 5 本の要求を 1 本ずつ流して測る（<code>vllm-steptime.py</code>）。内訳は、日本語の説明文（TCP のスロースタートと輻輳回避の違い）と Python コード（ISO 8601 の期間を秒に直す関数とテスト）を completions API（思考なしのテンプレートを手で適用）と chat API（思考を無効化）でそれぞれ 1 本、およびコードの続き書き 1 本（EOS を無視して 600 トークン）である。温度 0、最大 600 トークンで、ほかの要求が無い状態で head ノードから送る。以下で示す <var>t</var><sub>step</sub> の範囲は、この 5 本の最小から最大である。同じ構成を起動し直して測り直したときの差は、要求ごとに 0〜0.5 ms であった。温度 0 でも受理長は起動ごとに変わる（同じ要求で 2.82 と 2.93）。</p>
+  <p>時間の内訳は vLLM の torch profiler で取得した。帯域、FP8 GEMV、all-reduce、all-reduce と読み出しの干渉の単体測定は、推論を止めた状態で 8 台に同時に配るスクリプト（付録 B）で行った（コピーと cuBLAS の行列積の帯域は head ノードの値）。Marlin の行列積は推論を止めた head の 1 台で、L2 先読みは要求を流していない 1 台で測った。</p>
+
+  <h3><span class="num">3.3</span>既定構成の時間内訳</h3>
+  <p>図 2 に、既定の構成（5.1 節の構成 A）で、温度 0・192 トークンの要求を 1 本処理したときの 1 ステップの内訳を示す（プロファイラ下で 65.7 ms/step、素の状態では約 62 ms）。ルーティングされるエキスパートの行列積（DeepGEMM の FP8×FP4<span class="cite">[<a href="#ref-30">30</a>]</span>）が 23.7 ms（36%）、dense の線形層（FlashInfer の CUTLASS<span class="cite">[<a href="#ref-31">31</a>]</span> による MXFP8）が 18.2 ms（28%）、NCCL の集団通信（all-reduce 88 回・all-gather 6 回）が 13.8 ms（21%）、BF16 の線形層（4.3 節の <code>wo_a</code> など）が 5.6 ms（9%）を占めた。GPU が何らかのカーネルを実行していた時間の割合は 99.0% で（投機なしでも 98.4%）、CPU 側のオーバーヘッドやカーネル起動の待ちは律速になっていない。</p>
+
+  <figure class="wide chart" id="fig2">
+    <div class="fig-scroll"><svg viewBox="0 0 720 132" role="img" aria-label="既定の構成（A）の 1 ステップ 65.7 ms の内訳。MoE（DeepGEMM） 23.7 ms（36%）、dense（CUTLASS） 18.2 ms（28%）、NCCL 集団通信 13.8 ms（21%）、BF16 線形層 5.6 ms（9%）、その他 4.4 ms（7%）"><rect x="16.0" y="18.0" width="246.2" height="24.0" style="fill:var(--s1)" class="mark" tabindex="0" data-tip="MoE エキスパート（DeepGEMM の FP8×FP4、86 本）: 23.7 ms（36%）" aria-label="MoE エキスパート（DeepGEMM の FP8×FP4、86 本）: 23.7 ms（36%）"/><text x="139.1" y="34.5" font-size="12" text-anchor="middle" font-weight="700" style="fill:var(--on-s1)">36%</text><rect x="264.2" y="18.0" width="188.6" height="24.0" style="fill:var(--s2)" class="mark" tabindex="0" data-tip="dense 線形層（FlashInfer CUTLASS の MXFP8、229 本）: 18.2 ms（28%）" aria-label="dense 線形層（FlashInfer CUTLASS の MXFP8、229 本）: 18.2 ms（28%）"/><text x="358.5" y="34.5" font-size="12" text-anchor="middle" font-weight="700" style="fill:var(--on-fill)">28%</text><rect x="454.8" y="18.0" width="142.5" height="24.0" style="fill:var(--s3)" class="mark" tabindex="0" data-tip="NCCL の集団通信（all-reduce 88 回・all-gather 6 回）: 13.8 ms（21%）" aria-label="NCCL の集団通信（all-reduce 88 回・all-gather 6 回）: 13.8 ms（21%）"/><text x="526.0" y="34.5" font-size="12" text-anchor="middle" font-weight="700" style="fill:var(--on-fill)">21%</text><rect x="599.3" y="18.0" width="56.6" height="24.0" style="fill:var(--s4)" class="mark" tabindex="0" data-tip="BF16 線形層（wo_a ほか、62 本）: 5.6 ms（9%）" aria-label="BF16 線形層（wo_a ほか、62 本）: 5.6 ms（9%）"/><text x="627.6" y="34.5" font-size="12" text-anchor="middle" font-weight="700" style="fill:var(--on-fill)">9%</text><path d="M657.9,18.0 H700.0 A4.0,4.0 0 0 1 704.0,22.0 V38.0 A4.0,4.0 0 0 1 700.0,42.0 H657.9 Z" style="fill:var(--s5)" class="mark" tabindex="0" data-tip="その他（mHC・量子化・attention・indexer など約 1,300 本）: 4.4 ms（7%）" aria-label="その他（mHC・量子化・attention・indexer など約 1,300 本）: 4.4 ms（7%）"/><text x="681.0" y="34.5" font-size="12" text-anchor="middle" font-weight="700" style="fill:var(--on-fill)">7%</text><line x1="16.0" y1="48.0" x2="704.0" y2="48.0" style="stroke:var(--rule);stroke-width:1"/><line x1="16.0" y1="48.0" x2="16.0" y2="52.0" style="stroke:var(--muted);stroke-width:1"/><text x="16.0" y="65.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">0</text><line x1="120.7" y1="48.0" x2="120.7" y2="52.0" style="stroke:var(--muted);stroke-width:1"/><text x="120.7" y="65.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">10</text><line x1="225.4" y1="48.0" x2="225.4" y2="52.0" style="stroke:var(--muted);stroke-width:1"/><text x="225.4" y="65.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">20</text><line x1="330.2" y1="48.0" x2="330.2" y2="52.0" style="stroke:var(--muted);stroke-width:1"/><text x="330.2" y="65.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">30</text><line x1="434.9" y1="48.0" x2="434.9" y2="52.0" style="stroke:var(--muted);stroke-width:1"/><text x="434.9" y="65.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">40</text><line x1="539.6" y1="48.0" x2="539.6" y2="52.0" style="stroke:var(--muted);stroke-width:1"/><text x="539.6" y="65.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">50</text><line x1="644.3" y1="48.0" x2="644.3" y2="52.0" style="stroke:var(--muted);stroke-width:1"/><text x="644.3" y="65.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">60</text><text x="704.0" y="65.0" font-size="11" text-anchor="end" class="mono" style="fill:var(--muted)">65.7 ms</text><rect x="16.0" y="82.0" width="11.0" height="11.0" rx="2" style="fill:var(--s1)"/><text x="33.0" y="92.0" font-size="12" text-anchor="start" style="fill:var(--ink)">MoE（DeepGEMM）　23.7 ms・36%</text><rect x="256.0" y="82.0" width="11.0" height="11.0" rx="2" style="fill:var(--s2)"/><text x="273.0" y="92.0" font-size="12" text-anchor="start" style="fill:var(--ink)">dense（CUTLASS）　18.2 ms・28%</text><rect x="496.0" y="82.0" width="11.0" height="11.0" rx="2" style="fill:var(--s3)"/><text x="513.0" y="92.0" font-size="12" text-anchor="start" style="fill:var(--ink)">NCCL 集団通信　13.8 ms・21%</text><rect x="16.0" y="104.0" width="11.0" height="11.0" rx="2" style="fill:var(--s4)"/><text x="33.0" y="114.0" font-size="12" text-anchor="start" style="fill:var(--ink)">BF16 線形層　5.6 ms・9%</text><rect x="256.0" y="104.0" width="11.0" height="11.0" rx="2" style="fill:var(--s5)"/><text x="273.0" y="114.0" font-size="12" text-anchor="start" style="fill:var(--ink)">その他　4.4 ms・7%</text></svg></div>
+    <figcaption><b>図 2</b>既定の構成（A）での 1 ステップの内訳（torch profiler、DSpark k=5、プロファイラ下 65.7 ms）。割合は 65.7 ms に対する値で、四捨五入のため和は 101% になる。帯にポインタを重ねると値を表示する。</figcaption>
+  </figure>
+
+  <p>投機なしでは dense が 46% を占め、MoE は 15% にとどまる。投機を使うと MoE が膨らむのは、検証の 6 行がそれぞれ別のエキスパートを選ぶためである。実際のルーティングを記録すると、1 層で読むエキスパートは 1 行なら 6 種類、6 行では 19.8〜22.7 種類、4 本を同時に検証する 24 行では 71 種類であった。</p>
+
+  <h3><span class="num">3.4</span>帯域と通信から見た下限</h3>
+  <p>テンソルの形と実際のルーティングから、各 rank が 1 ステップに読む重みを見積もると約 3.8〜4.1 GB になる。内訳は dense（attention・共有エキスパート・ルーター・mHC）が約 1.49 GB、ルーティングされるエキスパートが 1.86〜2.13 GB（1 個 2.35 MB × 1 層 19.8〜22.7 種類 × 40 層。ゼロパディングを含まない）、<code>lm_head</code> が 0.17 GB、ドラフトが約 0.3 GB である。メモリ帯域を <var>W</var>、rank あたりの読み出し量を <var>V</var> とすると、通信を除いても</p>
+  <div class="eq"><span class="f"><var>t</var><sub>step</sub> ≥ <var>V</var> / <var>W</var></span><span class="no">(3)</span></div>
+  <p>であり、公称の 273 GB/s で約 14〜15 ms、実効の約 220 GB/s では約 17〜19 ms になる。既定の構成（A）の約 62 ms は、実効の帯域での下限（約 17〜19 ms）に対して約 3 割（28〜30%）の効率であった。なお A の経路はエキスパートの中間次元を 384 に切り上げて読むので、エキスパートの実際の読み出しは 2.5〜2.8 GB になる。</p>
+  <p>損失は二つの部分にあった。第一は行列積である。TP=8 で rank あたり 1.5〜9.2 MB（共有エキスパートの <code>w2</code> から <code>wq_a</code>+<code>wkv</code> まで）に細分化された行列積が 1 ステップに約 300 本あり、既定のカーネル（FlashInfer の CUTLASS、起動時の自動チューニングは無効<sup class="fn"><a href="#fn2" id="fnref2">2</a></sup>）は推論中に約 60 GB/s しか出していなかった。同じ形を素朴な Triton の FP8 GEMV で回すと、1.5 MB の共有エキスパートの <code>w2</code>（145〜150 GB/s）を除いて 208〜240 GB/s が出る（表 3）。第二は all-reduce である。10〜60 KiB の小さなメッセージでも、NCCL<span class="cite">[<a href="#ref-32">32</a>]</span> は 1 回 111〜155 µs（CUDA グラフ）を要した。RDMA の片道の遅延は 2.5〜3.1 µs であり、時間の大半はリングやツリーの段数と、その進行のしかたから来ている<span class="cite">[<a href="#ref-33">33</a>, <a href="#ref-34">34</a>]</span>。NCCL のアルゴリズム、プロトコル、チャネル数を変えても縮まなかった。重みと投機を変えずに、行列積を帯域の上限近くで動かし、all-reduce を 1 回数十 µs にできれば、1 ステップは 21〜26 ms まで縮むと見積もった。</p>
+
+  <div class="tbl wide">
+    <table>
+      <caption><b>表 3</b>帯域と all-reduce の測定（(a) の最後の行だけ推論中のプロファイルからの実効、ほかは推論を止めた状態）</caption>
+      <thead><tr><th>(a) 帯域の測定</th><th class="n">帯域</th></tr></thead>
+      <tbody>
+        <tr><td>2 GiB のコピー（読み出し＋書き込み）</td><td class="n">224 GB/s</td></tr>
+        <tr><td>cuBLAS の BF16 行列積（M=1〜128、重み 2 GiB）</td><td class="n">155〜181 GB/s</td></tr>
+        <tr><td>Triton の FP8 GEMV（rank あたりの形 2.9〜9.5 MB の 5 形、CUDA グラフ）</td><td class="n">208〜240 GB/s</td></tr>
+        <tr><td>同・1 層分の dense 6 本を連続（28.6 MB）</td><td class="n">195〜207 GB/s</td></tr>
+        <tr><td>cuBLASLt の FP8 行列積（<code>torch._scaled_mm</code>）</td><td class="n">112〜210 GB/s</td></tr>
+        <tr><td>Marlin の MoE（<code>w13</code>・<code>w2</code>）</td><td class="n">約 225 GB/s</td></tr>
+        <tr><td>Marlin の dense（<code>wq_a</code>+<code>wkv</code>／<code>wq_b</code>／<code>wo_a</code>／<code>wo_b</code>）</td><td class="n">218／196／199／212 GB/s</td></tr>
+        <tr><td>vLLM 既定の dense（FlashInfer CUTLASS、推論中のプロファイルからの実効）</td><td class="n">約 60 GB/s</td></tr>
+      </tbody>
+    </table>
+    <table style="margin-top:1.2rem">
+      <thead><tr><th>(b) all-reduce（8 台、BF16）</th><th class="n">NCCL グラフ</th><th class="n">NCCL eager</th><th class="n">RDMA グラフ</th><th class="n">RDMA eager</th></tr></thead>
+      <tbody>
+        <tr><td>10 KiB（1 行）</td><td class="n">111</td><td class="n">72.7</td><td class="n">17.9</td><td class="n">42.6</td></tr>
+        <tr><td>40 KiB</td><td class="n">—</td><td class="n">105.9</td><td class="n">30.7</td><td class="n">37.6</td></tr>
+        <tr><td>60 KiB（検証 6 行）</td><td class="n">155</td><td class="n">121.6</td><td class="n">39.4</td><td class="n">45.8</td></tr>
+        <tr><td>240 KiB</td><td class="n">170</td><td class="n">161.4</td><td class="n">107.8</td><td class="n">106.3</td></tr>
+        <tr><td>320 KiB</td><td class="n">—</td><td class="n">166.2</td><td class="n">138.4</td><td class="n">138.4</td></tr>
+        <tr><td>1 MiB</td><td class="n">267</td><td class="n">251.3</td><td class="n">378.8</td><td class="n">380.2</td></tr>
+      </tbody>
+    </table>
+    <p class="tnote">(a) の Triton の GEMV は <code>wq_a</code>+<code>wkv</code> を 1856×5120（9.5 MB）の形で測った（Marlin と表 2 の形は 1792×5120 の 9.2 MB。1 層分の dense も表 2 の形では 28.3 MB）。1.5 MB の共有エキスパートの <code>w2</code> は 145〜150 GB/s。既定の dense の実効は、投機なしのプロファイルで CUTLASS の線形層が 1 ステップ 16.1 ms、CUTLASS が読む重みが約 0.96 GB（1 層約 24.1 MB × 40 層。BF16 のエミュレーションで別のカーネルが読む <code>wo_a</code> は含めない）からの計算。(b) の単位は µs。「グラフ」は CUDA グラフでの再生、RDMA は 4.4 節の one-shot all-reduce。NCCL グラフは NCCL 単独の測定、NCCL eager は RDMA と同じプロセスでの測定。NCCL は 4 チャネル。</p>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">4</span>最適化手法</h2>
+  <p>以下の各節に示す 1 ステップの短縮は、表 A1 の順に修正を積み上げたときの、直前の構成との差である（例外と値の取り方は 5.3 節）。</p>
+
+  <h3><span class="num">4.1</span>小さいバッチ向けの行列積カーネル</h3>
+  <p>Marlin<span class="cite">[<a href="#ref-35">35</a>]</span> は重みだけを低ビットで持ち、活性は 16 ビットのまま計算する小さいバッチ向けの行列積カーネルである。原論文は FP16 の活性と INT4 の重みを扱い、vLLM の実装は BF16 の活性と FP8・MXFP4・MXFP8 の重みにも対応する。vLLM では起動引数で、dense の線形層と MoE の両方に選べる。ルーティングされるエキスパートには MXFP4 の W4A16 を、dense の線形層には MXFP8 の W8A16 を用いた。既定の経路（MXFP8 の CUTLASS、FP8×FP4 の DeepGEMM）は活性も FP8 に量子化して計算するのに対し、Marlin は活性を BF16 のまま扱う。</p>
+  <p>Marlin に切り替えると、1 ステップは 60.6〜63.9 ms から 41.3〜43.3 ms になった（1.5 倍）。dense だけを替えた場合は 53.2〜57.2 ms で、効果の大半は MoE 側にある。単体では Marlin の MoE は <code>w13</code>・<code>w2</code> とも約 225 GB/s、dense の主要な形は 196〜218 GB/s で動き（表 3）、どちらもコピーの実測 224 GB/s に並ぶ。MoE ではタイルの設定を変えても差は 1〜4% で（dense はタイルを変えて測っていない）、どちらも専用のカーネルを書いて速くなる余地はほとんど無い。FlashInfer に実験的な機能として同梱されたカーネル集 b12x は、MoE（W4A8）だけを替えると 1 ステップ 42.2〜44.0 ms、dense（MXFP8）だけを替えると 42.4〜44.2 ms で、どちらも Marlin を上回らず、KV キャッシュの容量も減った（493 万から 329 万・419 万トークン）。</p>
+
+  <h3><span class="num">4.2</span>TP 分割で生じるゼロパディングの削除</h3>
+  <p>Marlin の経路でも、TP 分割で生じた形の端数がゼロパディングとして毎ステップ読まれていた。実際のルーティングから換算した MoE の実効帯域は 157〜172 GB/s で、単体の約 225 GB/s を下回っていたが、この差は次に述べるパディング（読み出し 1.33 倍）でほぼ説明できる。</p>
+  <p><strong>エキスパートの中間次元。</strong>中間次元 2304 は TP=8 で rank あたり 288 になる。vLLM の Marlin 経路はこれを 128 の倍数の 384 に切り上げており、エキスパートの読み出しが 1.33 倍になっていた。Marlin の MoE カーネルは 64 の倍数で動く（<code>w13</code> の出力 N と <code>w2</code> の入力 K のタイルが 64）ので、切り上げを 64 単位の 320（1.11 倍）にした。1 ステップは 1.9〜2.8 ms 縮み、重みは rank あたり 7.7 GiB 減った。</p>
+  <p><strong><code>w13</code> のゼロ行。</strong>この切り上げは、<code>w13</code>（出力 N）と <code>w2</code>（入力 K）に同じ中間次元を使うためのもので、64 の倍数にするために切り上げが要るのは <code>w2</code> の K（288）だけである。<code>w13</code> の N＝2×288＝576 はすでに 64 の倍数なので、読み込み時に <code>w13</code> のゼロ行を捨てて 576 行に並べ直し、<code>w2</code> は K＝320 のまま残す（表 4）。中間の活性は 288 列を書いたあと、<code>w2</code> のゼロ行と掛け合わされる残り 32 列を毎回 0 で埋める。未初期化の値が NaN だと、0 との積も NaN になるためである。<code>w13</code> の読み出しは 1 割減り、1 ステップは 0.6〜1.0 ms 縮んだ。</p>
+
+  <div class="tbl">
+    <table>
+      <caption><b>表 4</b>エキスパートの中間次元の扱い（rank あたり）</caption>
+      <thead><tr><th>扱い</th><th class="n">中間次元</th><th class="n"><code>w13</code> の行</th><th class="n"><code>w2</code> の K</th><th class="n">読み出し（本来比）</th></tr></thead>
+      <tbody>
+        <tr><td>本来の形</td><td class="n">288</td><td class="n">576</td><td class="n">288</td><td class="n">1.00</td></tr>
+        <tr><td>vLLM の既定と Marlin の経路（128 単位）</td><td class="n">384</td><td class="n">768</td><td class="n">384</td><td class="n">1.33</td></tr>
+        <tr><td>64 単位</td><td class="n">320</td><td class="n">640</td><td class="n">320</td><td class="n">1.11</td></tr>
+        <tr class="em"><td>64 単位＋<code>w13</code> のゼロ行を捨てる</td><td class="n">288／320</td><td class="n">576</td><td class="n">320</td><td class="n">約 1.04</td></tr>
+      </tbody>
+    </table>
+    <p class="tnote">最終行の読み出しは、<code>w13</code> がエキスパートの重みの 2/3 を占めることからの計算値。<code>w2</code> の K は Marlin のタイルの制約から 64 の倍数にする。</p>
+  </div>
+
+  <p><strong>共有エキスパート。</strong>共有エキスパートの中間次元も rank あたり 288 である。Marlin の dense カーネルは K が 64 の倍数でないと、推論のたびに活性を詰め直す（1 ステップ約 40 回、各 17 µs のコピー）。読み込み時に重みを 320 まで 0 で埋めておき、この詰め直しをなくした。</p>
+
+  <h3><span class="num">4.3</span>形の合わない小さな行列</h3>
+  <p><strong>出力のグループ射影。</strong>attention の出力射影の前段 <code>wo_a</code> は 8 グループのグループ射影で、vLLM はこれをバッチ行列積（BMM）として扱う。SM12x には BMM 用の FP8 カーネルが無く、読み込み時に BF16 へ戻すエミュレーションに落ちて、重みを 2 倍読んでいた。TP=8 では rank あたり 1 グループなので、グループ射影は通常の行列積と同じである。この場合に限り通常の線形層として扱い、Marlin で FP8 のまま読むようにした。1 ステップは 1.2〜1.5 ms 縮んだ。</p>
+  <p><strong>ルーター。</strong>MoE のルーター（BF16、384×5120）には、vLLM が Hopper（SM90）と SM100 に限って使う CuTe DSL の低遅延 GEMM<span class="cite">[<a href="#ref-31">31</a>]</span> がある。このカーネルに必要なのは PDL（programmatic dependent launch）とスレッドブロッククラスタだけで、SM12x も備えているため、GB10 でも有効にした。ルーターは 1 層 33 µs から 24.5 µs になった（40 層で約 0.34 ms）。共有エキスパートの修正と合わせた 1 ステップの短縮は 0.1〜0.6 ms で、ルーターの分と同じくらいであった。共有エキスパートは補助ストリームでルーティングされるエキスパートと並行して動くため、活性の詰め直し（計 0.68 ms）が消えても 1 ステップはほとんど縮まないと考えられる。</p>
+
+  <h3><span class="num">4.4</span>one-shot RDMA all-reduce</h3>
+  <p>FlashInfer 0.7.2 は、b12x の通信ランタイム RoCEnante を実験的な機能として同梱している<span class="cite">[<a href="#ref-36">36</a>, <a href="#ref-37">37</a>]</span>。これは、ピン留めしたホストメモリを GPU がその場で読み書きでき、NIC がそのメモリへ RDMA で書ける DGX Spark の構成を前提とした、one-shot の all-reduce と all-gather である（図 3）。各 rank はピン留めした領域を 1 つ持ち、GPU のカーネル（大きさに応じて 1〜8 CTA（cooperative thread array）。検証 1 本分の 60 KiB では 4 CTA）が入力を送信スロットへ書いて CPU のプロキシスレッドに知らせる。プロキシは 7 つの相手へ RDMA WRITE を出し（2 本のレールに分散）、GPU は相手から届いたデータと到着フラグを待って、rank の固定の順に FP32 で足す。全 rank が同じ順で足すので、結果は rank の間でビット単位に一致する。1 回のカーネル起動で完結し、NCCL のような段の往復を持たない。</p>
+
+  <figure class="wide" id="fig3">
+    <div class="fig-scroll"><svg viewBox="0 0 960 290" role="img" aria-label="one-shot RDMA all-reduce の流れ。GPU が送信スロットに入力を書き、CPU のプロキシが 7 つの相手へ RDMA WRITE を出し、相手から届いたデータとフラグを GPU が待って rank の固定順に足す。"><defs><marker id="ah-os" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs><rect x="20.0" y="36.0" width="160.0" height="196.0" rx="6" style="fill:var(--tint);stroke:var(--ink-2);stroke-width:1"/><text x="100.0" y="62.0" font-size="13" text-anchor="middle" font-weight="700" style="fill:var(--ink)">GPU のカーネル</text><text x="100.0" y="80.0" font-size="11.5" text-anchor="middle" style="fill:var(--muted)">（60 KiB で 4 CTA）</text><text x="100.0" y="214.0" font-size="10.5" text-anchor="middle" style="fill:var(--muted)">rank の固定順に FP32 で</text><rect x="276.0" y="36.0" width="200.0" height="196.0" rx="6" style="fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.5"/><text x="376.0" y="58.0" font-size="12.5" text-anchor="middle" font-weight="700" style="fill:var(--ink)">ピン留めしたホストメモリ</text><rect x="292.0" y="78.0" width="168.0" height="44.0" rx="4" style="fill:var(--paper);stroke:var(--rule);stroke-width:1"/><text x="376.0" y="105.0" font-size="12" text-anchor="middle" style="fill:var(--ink)">送信スロット</text><rect x="292.0" y="160.0" width="168.0" height="58.0" rx="4" style="fill:var(--paper);stroke:var(--rule);stroke-width:1"/><text x="376.0" y="184.0" font-size="12" text-anchor="middle" style="fill:var(--ink)">受信スロット ×8</text><text x="376.0" y="202.0" font-size="12" text-anchor="middle" style="fill:var(--ink)">＋到着フラグ</text><rect x="540.0" y="70.0" width="132.0" height="60.0" rx="6" style="fill:var(--tint);stroke:var(--ink-2);stroke-width:1"/><text x="606.0" y="96.0" font-size="12.5" text-anchor="middle" font-weight="700" style="fill:var(--ink)">CPU プロキシ</text><text x="606.0" y="114.0" font-size="11" text-anchor="middle" style="fill:var(--muted)">（スレッド 1 本）</text><rect x="736.0" y="36.0" width="92.0" height="196.0" rx="6" style="fill:var(--tint);stroke:var(--ink-2);stroke-width:1"/><text x="782.0" y="62.0" font-size="13" text-anchor="middle" font-weight="700" style="fill:var(--ink)">NIC</text><text x="782.0" y="80.0" font-size="11" text-anchor="middle" style="fill:var(--muted)">Rail A・B</text><rect x="872.0" y="36.0" width="78.0" height="196.0" rx="6" style="fill:var(--paper);stroke:var(--ink-2);stroke-width:1"/><text x="911.0" y="62.0" font-size="12.5" text-anchor="middle" font-weight="700" style="fill:var(--ink)">他の</text><text x="911.0" y="80.0" font-size="12.5" text-anchor="middle" font-weight="700" style="fill:var(--ink)">7 rank</text><line x1="180.0" y1="100.0" x2="290.0" y2="100.0" style="stroke:var(--ink-2);stroke-width:1.3" marker-end="url(#ah-os)"/><text x="235.0" y="92.0" font-size="11" text-anchor="middle" style="fill:var(--ink-2)">① 入力を書く</text><line x1="460.0" y1="100.0" x2="538.0" y2="100.0" style="stroke:var(--ink-2);stroke-width:1.3" marker-end="url(#ah-os)"/><text x="499.0" y="92.0" font-size="11" text-anchor="middle" style="fill:var(--ink-2)">② 通知</text><line x1="672.0" y1="100.0" x2="734.0" y2="100.0" style="stroke:var(--ink-2);stroke-width:1.3" marker-end="url(#ah-os)"/><text x="703.0" y="92.0" font-size="11" text-anchor="middle" style="fill:var(--ink-2)">③ 発行</text><line x1="828.0" y1="100.0" x2="870.0" y2="100.0" style="stroke:var(--ink-2);stroke-width:1.3" marker-end="url(#ah-os)"/><text x="849.0" y="92.0" font-size="10" text-anchor="middle" class="mono" style="fill:var(--ink-2)">WRITE</text><line x1="870.0" y1="189.0" x2="830.0" y2="189.0" style="stroke:var(--ink-2);stroke-width:1.3" marker-end="url(#ah-os)"/><line x1="734.0" y1="189.0" x2="462.0" y2="189.0" style="stroke:var(--ink-2);stroke-width:1.3" marker-end="url(#ah-os)"/><text x="598.0" y="181.0" font-size="11" text-anchor="middle" style="fill:var(--ink-2)">④ 相手のデータとフラグが届く（NIC の DMA）</text><line x1="290.0" y1="189.0" x2="182.0" y2="189.0" style="stroke:var(--ink-2);stroke-width:1.3" marker-end="url(#ah-os)"/><text x="235.0" y="181.0" font-size="11" text-anchor="middle" style="fill:var(--ink-2)">⑤ 待って足す</text><text x="480.0" y="262.0" font-size="11.5" text-anchor="middle" style="fill:var(--muted)">1 回のカーネル起動で完結する。全 rank が同じ順で足すので、結果は rank の間でビット単位に一致する。</text><text x="480.0" y="280.0" font-size="11.5" text-anchor="middle" style="fill:var(--muted)">10 KiB で 17.9 µs、60 KiB で 39.4 µs（CUDA グラフでの再生、8 台）</text></svg></div>
+    <figcaption><b>図 3</b>one-shot RDMA all-reduce の 1 回の流れ（1 rank から見たもの）。GPU と NIC が同じピン留め領域を直接読み書きするので、GPU のメモリを NIC に登録する GPUDirect RDMA は要らない。</figcaption>
+  </figure>
+
+  <p>単体の測定（表 3）では、1 行分の 10 KiB で 17.9 µs、検証 1 本分の 60 KiB で 39.4 µs（CUDA グラフ）と、NCCL の 111 µs・155 µs の 1/4〜1/6 であった。一方、1 MiB では 378.8 µs で NCCL（同じプロセスの eager で 251.3 µs）より遅い。</p>
+  <p>vLLM の upstream には、このランタイムの組み込みが無い。コミュニティによる vLLM フォークへの組み込み（PR #597<span class="cite">[<a href="#ref-38">38</a>]</span>）は、大きさによる振り分け、CUDA グラフでの使用、rank 間の可否の投票、出力を返す rank での健全性の確認を備えていた。これに、フォークに出されてマージされずに閉じた PR #916<span class="cite">[<a href="#ref-39">39</a>]</span> の RoCE の部分（生きている通信器すべての健全性の確認と単体試験）を合わせ、upstream の nightly と FlashInfer 0.7.2 の準備 API に合わせて移植し、次の点を変えた・加えた（差分は追加 1,133 行・削除 4 行）。</p>
+  <ul>
+    <li><strong>振り分け。</strong>TP グループの all-reduce のうち 320 KiB 以下のもの、all-gather のうち 1 rank 分が 4 MiB 以下のものだけを RDMA に回し、それ以外は NCCL のままにする（フォークの上限は 2 MB と 16 MB）。上限は実測から、NCCL より確実に速い範囲に置いた（320 KiB では 138.4 µs 対 166.2 µs で RDMA が速く、1 MiB では 378.8 µs 対 251.3 µs で NCCL が速い。その間の大きさは測っておらず、表 3 の値を直線で結んだ見込みでは、両者が並ぶのは CUDA グラフで約 510 KiB、eager で約 450 KiB である）。中間の次元に沿った all-gather も最後の次元に平坦化して受け、Engram の表引きの集約も RDMA に載せる。</li>
+    <li><strong>CUDA グラフとの両立（2 段階の有効化）。</strong>グラフの取り込み中に出た集団通信だけを RDMA に回し、取り込み前の暖機は NCCL で走らせる。JIT コンパイルを伴う暖機では rank の間で進み方がずれ、RDMA の待ちの上限（ポーリング 2,000 万回、約 20〜30 秒）を超えうるためである。取り込みの後は、eager の呼び出しも RDMA に回す。</li>
+    <li><strong>起動時の合意と自己試験。</strong>有効化の設定を全 rank で突き合わせる。Ray はドライバの環境変数をワーカーに <code>setdefault</code> で写すため、ノードの側の値が勝って食い違いうるからである。準備の各段階の成否を全 rank で投票し、本番と同じ経路で、3 つのデータ型と代表的な大きさ・形の all-reduce と all-gather の答え合わせを済ませてから配信を始める。</li>
+    <li><strong>fail-stop の補強。</strong>待ちが上限を超えるとランタイムは使えない状態（毒化）になり、以後の出力は不定になる。フォークの、出力を返す rank がデバイスから結果を写した後にランタイムの健全性を確かめる処理だけでは、ほかの rank の失敗が NCCL 経由で出力に混ざる場合を見逃す。そこで、毎ステップのサンプリングの前に全 rank で 16 バイトの all-reduce（fence）を出すようにした。待ちが上限を超えた rank は、以後の eager の集団通信を起動せずに出力を 0 にして返し、fence も送らない。このため、どの rank が失敗しても、出力を返す rank の fence の待ちが上限を超えてそのランタイムが毒化し、写した後の確認で検出されてエンジンが止まる。逆に確認を通れば、全 rank が fence を送っており、それまでに各 rank が送った値は健全なランタイムで作られている。この性質は CPU 上の多プロセスの模擬試験で確かめたもので、実機での故障の注入は行っていない（6.4 節）。fence の費用（見積もりで GPU 時間約 18 µs）は <var>t</var><sub>step</sub> に表れなかった。</li>
+  </ul>
+  <p>推論中のプロファイル（5.3 節の構成 C）では、目標モデルとドラフトの all-reduce は 1 ステップ 88 回（回数は既定の構成と同じ）で約 4.0 ms（1 回の中央値 42.5 µs、四分位 38.7〜47.4 µs）、all-gather は 10 回で約 0.3 ms で、1 ステップの通信は NCCL の 13.6＋0.6 ms から 4.38 ms に減った。1 ステップの短縮は 8.0〜8.4 ms であった。なお 320 KiB の上限は、検証 1 本の 60 KiB に対して 5 本分にあたる。6 本以上を同時に処理すると、目標モデルの all-reduce は NCCL に戻る。</p>
+
+  <h3><span class="num">4.5</span>通信の待ちを使う L2 先読み</h3>
+  <p>RDMA all-reduce を使っても、1 ステップには 88 回の all-reduce が残る（all-gather と合わせて 4.38 ms）。RDMA の all-reduce の間、GPU では少数の CTA がフラグを待つだけで、SM もメモリ帯域もほとんど使われていない。一方、all-reduce の直後に読む重みは層の構造で決まっており、その大きさ（次の層の <code>wq_a</code>+<code>wkv</code> で 9.2 MB など）は L2（24 MB）に収まる。そこで、待ちの間に次の重みを、主ストリームとは別の先読みストリームで L2 に読み込んでおき、直後の行列積が DRAM ではなく L2 から読むようにした（図 4）。通信の後に読む重みを通信と並行して先読みする考え方は PRESERVE<span class="cite">[<a href="#ref-40">40</a>]</span> と同じである。</p>
+
+  <figure class="wide" id="fig4">
+    <div class="fig-scroll"><svg viewBox="0 0 960 300" role="img" aria-label="デコーダ 1 層の実行の模式図。MoE の all-reduce の間に次の層の wq_a+wkv を、wq_b の後の attention の間に wo_a と wo_b を、先読みストリームで L2 に読む。"><defs><marker id="ah-tl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker></defs><text x="12.0" y="98.0" font-size="12" text-anchor="start" font-weight="700" style="fill:var(--ink)">主ストリーム</text><text x="12.0" y="201.0" font-size="12" text-anchor="start" font-weight="700" style="fill:var(--ink)">先読み</text><text x="12.0" y="217.0" font-size="12" text-anchor="start" font-weight="700" style="fill:var(--ink)">ストリーム</text><text x="950.0" y="30.0" font-size="11" text-anchor="end" style="fill:var(--muted)">時間 →</text><rect x="120.0" y="70.0" width="38.0" height="46.0" rx="3" style="fill:var(--tint);stroke:var(--rule);stroke-width:1"/><text x="139.0" y="97.0" font-size="11" text-anchor="middle" style="fill:var(--ink)">mHC</text><rect x="160.0" y="70.0" width="58.0" height="46.0" rx="3" style="fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.2"/><text x="189.0" y="97.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--ink)">wq_a+wkv</text><rect x="220.0" y="70.0" width="42.0" height="46.0" rx="3" style="fill:var(--tint);stroke:var(--rule);stroke-width:1"/><text x="241.0" y="97.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--ink)">wq_b</text><rect x="264.0" y="70.0" width="128.0" height="46.0" rx="3" style="fill:var(--tint);stroke:var(--rule);stroke-width:1"/><text x="328.0" y="90.0" font-size="11" text-anchor="middle" style="fill:var(--ink)">attention</text><text x="328.0" y="105.0" font-size="11" text-anchor="middle" style="fill:var(--ink)">（sparse MLA）</text><rect x="394.0" y="70.0" width="36.0" height="46.0" rx="3" style="fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.2"/><text x="412.0" y="97.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--ink)">wo_a</text><rect x="432.0" y="70.0" width="36.0" height="46.0" rx="3" style="fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.2"/><text x="450.0" y="97.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--ink)">wo_b</text><rect x="470.0" y="70.0" width="52.0" height="46.0" rx="3" style="fill:var(--ar);stroke:var(--ink-2);stroke-width:1"/><text x="496.0" y="90.0" font-size="11" text-anchor="middle" style="fill:var(--ink)">all-</text><text x="496.0" y="105.0" font-size="11" text-anchor="middle" style="fill:var(--ink)">reduce</text><rect x="524.0" y="70.0" width="66.0" height="46.0" rx="3" style="fill:var(--tint);stroke:var(--rule);stroke-width:1"/><text x="557.0" y="90.0" font-size="11" text-anchor="middle" style="fill:var(--ink)">mHC・</text><text x="557.0" y="105.0" font-size="11" text-anchor="middle" style="fill:var(--ink)">ルーター</text><rect x="592.0" y="70.0" width="146.0" height="46.0" rx="3" style="fill:var(--tint);stroke:var(--rule);stroke-width:1"/><text x="665.0" y="97.0" font-size="11" text-anchor="middle" style="fill:var(--ink)">MoE（Marlin）</text><rect x="740.0" y="70.0" width="104.0" height="46.0" rx="3" style="fill:var(--ar);stroke:var(--ink-2);stroke-width:1"/><text x="792.0" y="97.0" font-size="11" text-anchor="middle" style="fill:var(--ink)">all-reduce</text><rect x="846.0" y="70.0" width="38.0" height="46.0" rx="3" style="fill:var(--tint);stroke:var(--rule);stroke-width:1"/><text x="865.0" y="97.0" font-size="11" text-anchor="middle" style="fill:var(--ink)">mHC</text><rect x="886.0" y="70.0" width="62.0" height="46.0" rx="3" style="fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.2"/><text x="917.0" y="97.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--ink)">wq_a+wkv</text><rect x="266.0" y="184.0" width="126.0" height="40.0" rx="3" style="fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.2"/><text x="329.0" y="201.0" font-size="11" text-anchor="middle" style="fill:var(--ink)">wo_a・wo_b を L2 へ</text><text x="329.0" y="216.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--ink)">9.4 MB</text><rect x="742.0" y="184.0" width="102.0" height="40.0" rx="3" style="fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.2"/><text x="793.0" y="201.0" font-size="11" text-anchor="middle" style="fill:var(--ink)">次層 wq_a+wkv</text><text x="793.0" y="216.0" font-size="11" text-anchor="middle" style="fill:var(--ink)">を L2 へ 9.2 MB</text><line x1="264.0" y1="118.0" x2="266.0" y2="182.0" style="stroke:var(--ink-2);stroke-width:1.3" marker-end="url(#ah-tl)"/><line x1="392.0" y1="182.0" x2="394.0" y2="118.0" style="stroke:var(--ink-2);stroke-width:1.3" marker-end="url(#ah-tl)"/><line x1="740.0" y1="118.0" x2="742.0" y2="182.0" style="stroke:var(--ink-2);stroke-width:1.3" marker-end="url(#ah-tl)"/><line x1="844.0" y1="182.0" x2="846.0" y2="118.0" style="stroke:var(--ink-2);stroke-width:1.3" marker-end="url(#ah-tl)"/><text x="258.0" y="156.0" font-size="10.5" text-anchor="end" style="fill:var(--muted)">分岐</text><text x="400.0" y="156.0" font-size="10.5" text-anchor="start" style="fill:var(--muted)">合流</text><text x="734.0" y="156.0" font-size="10.5" text-anchor="end" style="fill:var(--muted)">分岐</text><text x="852.0" y="156.0" font-size="10.5" text-anchor="start" style="fill:var(--muted)">合流</text><text x="432.0" y="58.0" font-size="11" text-anchor="middle" style="fill:var(--ink-2)">24・31 → 7・7 µs</text><text x="950.0" y="58.0" font-size="11" text-anchor="end" style="fill:var(--ink-2)">39.9 → 10.2 µs（単体）</text><text x="189.0" y="58.0" font-size="10.5" text-anchor="middle" style="fill:var(--muted)">（前の層の窓で L2 へ）</text><text x="793.0" y="242.0" font-size="11" text-anchor="middle" style="fill:var(--ink-2)">all-reduce は 1 回 約 +10 µs（単体）</text><text x="329.0" y="242.0" font-size="11" text-anchor="middle" style="fill:var(--ink-2)">attention の小カーネル 計 +10 µs</text><rect x="120.0" y="276.0" width="12.0" height="12.0" rx="2" style="fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.2"/><text x="138.0" y="286.0" font-size="11" text-anchor="start" style="fill:var(--ink)">L2 から読む重みと、その先読み</text><rect x="360.0" y="276.0" width="12.0" height="12.0" rx="2" style="fill:var(--ar);stroke:var(--ink-2);stroke-width:1"/><text x="378.0" y="286.0" font-size="11" text-anchor="start" style="fill:var(--ink)">8 台の all-reduce（RDMA）</text><rect x="580.0" y="276.0" width="12.0" height="12.0" rx="2" style="fill:var(--tint);stroke:var(--rule);stroke-width:1"/><text x="598.0" y="286.0" font-size="11" text-anchor="start" style="fill:var(--ink)">そのほかのカーネル</text></svg></div>
+    <figcaption><b>図 4</b>デコーダ 1 層の実行と、先読みの 2 つの窓（模式図。ブロックの長さは目安）。MoE の all-reduce の間に次の層の <code>wq_a</code>+<code>wkv</code> を、<code>wq_b</code> の後の attention の間に <code>wo_a</code>・<code>wo_b</code> を L2 へ読む。attention の窓は、indexer も KV 圧縮器も持たない 32 層とドラフトの 3 層だけで使う。µs の値は単体測定と、窓の組み方が異なる構成で 1 層を取ったプロファイルによる。</figcaption>
+  </figure>
+
+  <p><strong>単体での効果。</strong>L2 に載った重みなら、行列積は 2.2〜3.9 倍速い（表 5。大きい行列ほど差が大きい）。<code>wq_a</code>+<code>wkv</code>（9.2 MB）は DRAM から 39.9 µs、L2 から 10.2 µs で、40 µs の待ちと並べて先読みすると合計が 25.2 µs 縮む。9.2 MB の <code>wq_a</code>+<code>wkv</code> では、PTX の <code>prefetch.global.L2::evict_last</code> と TMA（tensor memory accelerator）の <code>cp.async.bulk.prefetch.L2</code><span class="cite">[<a href="#ref-41">41</a>]</span> は命令を出し終えるだけで、直後の行列積は 32〜36 µs とほとんど速くならず、効いたのは通常のロード（<code>ld.global.cg</code>、L1 を通さない）で読んで捨てる方法だけであった。5.2 MB 以下の <code>wq_b</code>・共有エキスパートの <code>w13</code>・ルーターでは、TMA の先読みも通常のロードと同程度に縮めた（<code>wq_b</code> で 13.0 µs 対 12.9 µs）。窓では、最も大きい <code>wq_a</code>+<code>wkv</code> にも効く通常のロードを使う。</p>
+
+  <div class="tbl">
+    <table>
+      <caption><b>表 5</b>L2 先読みの単体測定（6 行、CUDA グラフ）</caption>
+      <thead><tr><th>テンソル（rank あたり）</th><th class="n">DRAM から</th><th class="n">L2 から</th><th class="n">40 µs の待ちと並べた先読み</th></tr></thead>
+      <tbody>
+        <tr><td><code>wq_a</code>+<code>wkv</code>（FP8、9.2 MB、Marlin）</td><td class="n">39.9 µs</td><td class="n">10.2 µs</td><td class="n">−25.2 µs</td></tr>
+        <tr><td><code>wq_b</code>（FP8、5.2 MB、Marlin）</td><td class="n">23.8 µs</td><td class="n">7.6 µs</td><td class="n">−12.9 µs</td></tr>
+        <tr><td>ルーター（BF16、3.9 MB、<code>torch.mm</code>）</td><td class="n">20.2 µs</td><td class="n">7.8 µs</td><td class="n">−12.2 µs</td></tr>
+        <tr><td>共有エキスパートの <code>w13</code>（FP8、3.3 MB、Marlin）</td><td class="n">15.7 µs</td><td class="n">7.0 µs</td><td class="n">−9.6 µs</td></tr>
+      </tbody>
+    </table>
+    <p class="tnote">重みは 8 組を順に使い、L2 に残らないようにした。先読みは通常のロードで 44 CTA。GPU がほかの仕事をしていない状態で測った。</p>
+  </div>
+
+  <p><strong>統合メモリでの干渉。</strong>8 台で、60 KiB の RDMA all-reduce と DRAM の読み出しを並べて測った（表 6）。all-reduce は単独で 42.5 µs、9 MiB の読み出しは単独で 40.0 µs だが、並べると両方が終わるまでに 50〜61 µs かかった。4 MiB の読み出し（単独 16.0 µs）と並べても 53.0 µs で、読み出しの量によらず all-reduce 単独より約 10 µs 長い。読み出しの開始を 4〜16 µs 遅らせても縮まず、CTA を減らして読み出しを遅くしても、両方が終わるまでの時間は読み出し単独より長いままであった。表 6 は両方が終わるまでの時間だけを測っており、どちらが延びたかは分けていないが、読み出しが終わるまで all-reduce も終わらないと考えている。CPU・GPU・NIC が同じ LPDDR5X を使うため、RDMA のカーネル（ピン留めメモリのフラグ待ちと集約）と NIC の DMA が、大量の読み出しに待たされるためとみている。</p>
+
+  <div class="tbl">
+    <table>
+      <caption><b>表 6</b>RDMA all-reduce と DRAM 読み出しの干渉（60 KiB、8 台、CUDA グラフ）</caption>
+      <thead><tr><th>条件</th><th class="n">単独</th><th class="n">並べる</th><th class="n">順に流す</th></tr></thead>
+      <tbody>
+        <tr><td>all-reduce のみ</td><td class="n">42.5 µs</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>9 MiB の読み出し（48 CTA × 8 warp）</td><td class="n">40.0 µs</td><td class="n">50〜61 µs</td><td class="n">84.8 µs</td></tr>
+        <tr><td>4 MiB の読み出し（48 CTA × 8 warp）</td><td class="n">16.0 µs</td><td class="n">53.0 µs</td><td class="n">60.0 µs</td></tr>
+        <tr><td>9 MiB の読み出し（16 CTA × 4 warp）</td><td class="n">69.0 µs</td><td class="n">76.3 µs</td><td class="n">—</td></tr>
+        <tr><td>9 MiB の読み出しの開始を 4〜16 µs 遅らせる</td><td class="n">—</td><td class="n">52〜60 µs</td><td class="n">—</td></tr>
+      </tbody>
+    </table>
+    <p class="tnote">「単独」はその行の処理（all-reduce または読み出し）だけの時間、「並べる」は all-reduce と読み出しを別ストリームで同時に始めて両方が終わるまでの時間、「順に流す」は all-reduce の後に同じストリームで読み出しを流したときの合計。表 3 とは別の日の測定で、all-reduce 単独は 42.5〜42.8 µs。8・4 CTA での並べる時間は、読み出し単独よりそれぞれ 16・22 µs 長かった。</p>
+  </div>
+
+  <p><strong>共有メモリの占有。</strong>Marlin は 1 CTA で SM の共有メモリをほぼ使い切る（約 99 KB）。先読みの CTA が残っている SM では Marlin の CTA が起動できず、先読みが次の行列積と重なると、かえってその行列積を遅らせる。</p>
+  <p><strong>設計則。</strong>以上から、all-reduce と重ねる窓では、1 つにつき all-reduce が約 10 µs 延びることを前提に、それより明らかに大きく縮むものだけを使う。読む量は窓の長さに収め、窓を閉じる時点で主ストリームが先読みの全体を待ってから次の Marlin を始める。これに合うのは、MoE の出力の all-reduce の間に次の層の <code>wq_a</code>+<code>wkv</code>（9.2 MB。単体で DRAM から 39.9 µs、L2 から 10.2 µs）を読む <em>MoE の窓</em>（設定値 <code>moe</code>）であった。<code>wq_b</code> の後の attention の間に <code>wo_a</code>・<code>wo_b</code>（計 9.4 MB）を読む <em>attention の窓</em>（設定値 <code>attn</code>）は all-reduce と重ならず、代償は attention の側で払う。この読み出し（約 233 GB/s で約 40 µs）は、先読みが無いときの attention（<code>wq_b</code> の終わりから <code>wo_a</code> の始まりまで約 28 µs）より長く、<code>wo_a</code> はその終わりを待つうえ、attention の小さなカーネルも遅れる。窓の組み方が異なる構成で 1 層を取ったプロファイルでは、<code>wo_a</code>・<code>wo_b</code> は 24・31 µs から 7・7 µs になり、attention の小さなカーネルは計約 10 µs 遅れた。そこから見積もる短縮は 35 層で約 1.1 ms だが、実測の短縮は 0.2〜0.4 ms にとどまり、差の内訳は切り分けていない。attention の窓は、indexer や KV 圧縮器を持つ層では除く。その層では attention の中の行列積が、先読みに占められた SM を待つためである。</p>
+  <p>ほかの候補も割に合わなかった。attention の出力の all-reduce の間にルーター・mHC 係数・共有エキスパートを読む窓では、推論中のプロファイルで、共有エキスパートは補助ストリームで MoE と並行するため縮んでも効かず、ルーターと mHC の得（約 7 µs）が all-reduce の延び（17〜19 µs）を下回った。MoE の窓に次の層の mHC 係数（2 MB）を足すと、読み出しが all-reduce より長くなって、その分 all-reduce が延びた。mHC の計算中（約 16〜19 µs）に <code>wq_b</code> の先頭 3 MB やルーターを読む窓は、mHC の小さなカーネルが遅れる分と相殺して差が出なかった（表 7）。</p>
+
+  <div class="tbl wide">
+    <table>
+      <caption><b>表 7</b>先読みの窓の比較（<var>t</var><sub>step</sub> [ms]、5 本の要求の範囲）</caption>
+      <thead><tr><th>窓（読み込む重み）</th><th class="n">日本語の説明</th><th class="n">Python コード</th><th class="n">続き書き</th></tr></thead>
+      <tbody>
+        <tr><td>先読みなし</td><td class="n">27.8〜28.0</td><td class="n">29.2〜29.3</td><td class="n">28.8</td></tr>
+        <tr><td>MoE の窓（次の層の <code>wq_a</code>+<code>wkv</code>）</td><td class="n">27.1〜27.3</td><td class="n">28.4〜28.6</td><td class="n">28.7</td></tr>
+        <tr><td>MoE＋attention の窓（<code>wo_b</code> のみ）</td><td class="n">27.0〜27.3</td><td class="n">28.4</td><td class="n">28.5</td></tr>
+        <tr class="em"><td>MoE＋attention の窓（<code>wo_a</code>・<code>wo_b</code>、採用）</td><td class="n">26.9〜27.1</td><td class="n">28.2</td><td class="n">28.3</td></tr>
+        <tr><td>同・先読みを 32 CTA で</td><td class="n">27.0〜27.1</td><td class="n">28.2</td><td class="n">28.2</td></tr>
+        <tr><td>同＋mHC 計算中の窓 2 つ（<code>wq_b</code> の先頭 3 MB・ルーター）</td><td class="n">27.1〜27.4</td><td class="n">28.3〜28.4</td><td class="n">28.2</td></tr>
+      </tbody>
+    </table>
+    <p class="tnote">いずれもドラフト側の固定費の削減（4.6 節）を含み、<code>w13</code> のゼロ行の削除（4.2 節）を含まない構成で測った。続き書きは出力が構成ごとに分岐するため、ほかの 2 列と傾向が揃わない。</p>
+  </div>
+
+  <p><strong>実装。</strong>先読みは値に一切触れず、先読みストリームは読んだ値を捨てるだけである。モデルは層ごとに、all-reduce の直後に読む重みを「プラン」として登録し、通信層は all-reduce の要素数が登録と一致したときだけ、主ストリームの仕事を待ってから先読みストリームで読み出しを始め、all-reduce の後に主ストリームに読み出しの完了を待たせる。attention の窓は、<code>wq_b</code> の直後に分岐し、<code>wo_a</code> の直前で合流する。読み出しは Triton のカーネル（48 CTA × 8 warp、1 回 2048 語、<code>ld.global.cg</code>）で、各 CTA が読んだ値の和を作業用の領域に 1 語ずつ書く（ロードが消されないようにするため）。分岐と合流は CUDA グラフの辺として取り込まれ、層のループの最後で必ず先読みストリームを合流させて、グラフが閉じるようにした。先読みは 64 トークン以下のバッチ（検証 6 行の要求なら 10 本まで）に限る。区切りのある（piecewise の）CUDA グラフでは attention を eager で実行し、先読みストリームがその切れ目をまたげないので、attention の窓を使わない。prefill を含むステップはこの形で走る。設定はモデルの構築時に読む。Ray のワーカーは vLLM を import した後に環境変数を受け取るので、import の時点で読むと全 rank で無効になるためである。1 ステップのトークン数が 32 を超える（検証 6 行で 6 本以上）と目標モデルの all-reduce は NCCL に戻るが、先読みは 64 トークンまで続き、NCCL の all-reduce と重なる。この組み合わせでの短縮と干渉は測っていない。</p>
+  <p>2 つの窓で、1 ステップは要求ごとに 0.5〜1.1 ms 縮んだ（MoE の窓が 0.1〜0.9 ms、attention の窓が 0.2〜0.4 ms。範囲の両端どうしでは 0.9〜1.0 ms）。出力が構成ごとに分岐する続き書きでは 0.5 ms にとどまる。先読みと並ぶ RDMA all-reduce は単体測定（表 6）で 1 回約 10 µs 延びるが、それを差し引いても 1 ステップは縮んだ。採用した窓の組み方での推論中の延びは、プロファイラで確かめていない（6.4 節）。</p>
+
+  <h3><span class="num">4.6</span>投機ドラフトの固定費</h3>
+  <p>DSpark のドラフトは、1 ステップに約 3.2 ms の固定費を持つ。このうち、受理の判定に影響しない部分を削った。</p>
+  <p><strong>語彙を分担した Markov 補正。</strong>DSpark は提案の各位置で、基底ロジットに Markov 補正を足して argmax を取る。vLLM の実装では、各 rank が語彙全体（66 MB）の補正を 1 ステップに 5 回計算していた。各 rank が自分の受け持つ語彙 1/8 についてだけ補正後の最大値とその位置を求め、(値, 位置) の 16 バイトを all-gather して全体の argmax を選ぶようにした。全語彙の argmax と同じトークンを選ぶので近似ではない（同点は最小の語彙 ID を選ぶ）。速さは、補正を基底ロジットの上位 4,096 候補にだけ掛ける近似とほぼ同じで（RDMA all-reduce を入れた構成で 30.6〜32.3 ms 対 30.6〜32.4 ms）、その近似は 1 ステップを要求ごとに 1.1〜1.9 ms 縮めた。上位 128 候補に絞る近似は受理長を下げた（日本語の説明で 2.9 から 2.5）ため用いない。</p>
+  <p><strong>FP8 の <code>lm_head</code> の写し。</strong>ドラフトの基底ロジットは、rank あたり 165 MB の BF16 の <code>lm_head</code> を毎ステップ読む（0.73 ms）。読み込み時に、32 要素ごとに 2 の冪のスケールを持つ MXFP8 の写し（83 MB）を作り、ドラフトだけがそれを読む。目標モデルは BF16 の <code>lm_head</code> のまま検証するので、受理の判定は変わらない。近い同点で別のトークンを提案することはありうるが、受け入れるかどうかは目標モデルが決める。</p>
+  <p><strong><code>main_proj</code> の分割。</strong>ドラフトの <code>main_proj</code>（FP8、78.6 MB）は全 rank に複製され、毎ステップ読まれていた（0.35 ms）。これを行の方向に TP 分割し、部分和を all-reduce 1 回で足すようにした。FP8 の写しと合わせて、1 ステップは要求ごとに 0.5〜1.0 ms 縮んだ。受理長は変わらなかった。</p>
+</section>
+
+<section id="s5">
+  <h2><span class="num">5</span>評価</h2>
+
+  <h3><span class="num">5.1</span>評価した構成</h3>
+  <p>表 8 の 4 つの構成を比べる。A は vLLM の既定のカーネルに、GB10 で動かすための upstream の PR だけを加えたもの、B は A のカーネルを Marlin に替えたもの、C と D は本稿の修正をそれぞれ 6 件と 9 件加えたものである。D が本稿の提案構成である。4 つの構成はいずれも DSpark（k=5）を使う<sup class="fn"><a href="#fn3" id="fnref3">3</a></sup>。</p>
+
+  <div class="tbl wide">
+    <table>
+      <caption><b>表 8</b>評価した構成</caption>
+      <thead><tr><th>構成</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><th>A</th><td>vLLM 既定のカーネル（dense: FlashInfer CUTLASS の MXFP8（自動チューニングは無効）、MoE: DeepGEMM の FP8×FP4、<code>wo_a</code>: BF16 エミュレーション）、all-reduce は NCCL</td></tr>
+        <tr><th>B</th><td>A ＋ Marlin（dense・MoE）。起動設定の変更のみ</td></tr>
+        <tr><th>C</th><td>B ＋ <code>wo_a</code> の線形化、ドラフトの語彙分担、RDMA all-reduce、エキスパートの中間次元の 64 単位化、共有エキスパートの読み込み時のパディング、ルーターの低遅延 GEMM（修正 6 件）</td></tr>
+        <tr class="em"><th>D</th><td>C ＋ L2 先読み、ドラフトの FP8 <code>lm_head</code> と <code>main_proj</code> の分割、<code>w13</code> のゼロ行の削除（修正 9 件、提案構成）</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3><span class="num">5.2</span>単一ストリームの性能</h3>
+  <p>表 9 と図 5 に、3.2 節の条件での結果を示す。D の 1 ステップは 26.1〜27.7 ms で、A の 60.6〜63.9 ms に対して 2.3 倍速い（範囲の両端どうしの比で 2.31〜2.32）。生成速度は日本語の説明で 46.8〜46.9 から 108.7〜114.9 tok/s（2.3〜2.5 倍）、Python コードで 74.3〜75.2 から 163.9〜168.9 tok/s（2.2〜2.3 倍）になった。日本語の説明と Python コードでは受理長 <var>τ</var> が構成によらずほぼ同じ範囲にあり、式 (2) より、速くなった分はほぼ <var>t</var><sub>step</sub> の短縮による。コードの続き書きは温度 0 の出力が構成ごとに分岐するため、<var>τ</var> が 3.55〜5.94 と大きく動く。</p>
+
+  <div class="tbl wide">
+    <table>
+      <caption><b>表 9</b>単一ストリームの性能（温度 0、600 トークン。括弧内は受理長 <var>τ</var>）</caption>
+      <thead><tr><th>構成</th><th class="n"><var>t</var><sub>step</sub> [ms]</th><th class="n">日本語の説明 [tok/s]</th><th class="n">Python コード [tok/s]</th><th class="n">続き書き [tok/s]</th><th class="n">A との比</th></tr></thead>
+      <tbody>
+        <tr><th>A</th><td class="n">60.6〜63.9</td><td class="n">46.8〜46.9（2.84）</td><td class="n">74.3〜75.2（4.72〜4.80）</td><td class="n">55.8（3.55）</td><td class="n">1.0</td></tr>
+        <tr><th>B</th><td class="n">41.3〜43.3</td><td class="n">66.3〜69.6（2.74〜2.88）</td><td class="n">102.7〜111.8（4.41〜4.84）</td><td class="n">137.1（5.94）</td><td class="n">1.5</td></tr>
+        <tr><th>C</th><td class="n">28.4〜29.8</td><td class="n">95.2〜102.0（2.75〜2.90）</td><td class="n">152.3〜158.8（4.54〜4.72）</td><td class="n">159.6（4.76）</td><td class="n">2.1</td></tr>
+        <tr class="em"><th>D</th><td class="n">26.1〜27.7</td><td class="n">108.7〜114.9（2.83〜3.02）</td><td class="n">163.9〜168.9（4.48〜4.62）</td><td class="n">214.8（5.94）</td><td class="n">2.3</td></tr>
+      </tbody>
+    </table>
+    <p class="tnote">C の <var>τ</var> は tok/s と <var>t</var><sub>step</sub> からの計算値。A との比は <var>t</var><sub>step</sub> の範囲の両端どうしの比。</p>
+  </div>
+
+  <figure class="wide chart" id="fig5">
+    <div class="fig-scroll"><svg viewBox="0 0 720 232" role="img" aria-label="構成ごとの 1 ステップの時間。A 60.6〜63.9 ms（1.0×）、B 41.3〜43.3 ms（1.5×）、C 28.4〜29.8 ms（2.1×）、D 26.1〜27.7 ms（2.3×）"><line x1="190.0" y1="10.0" x2="190.0" y2="202.0" style="stroke:var(--ink-2);stroke-width:1"/><text x="190.0" y="220.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">0</text><line x1="261.4" y1="10.0" x2="261.4" y2="202.0" style="stroke:var(--rule);stroke-width:1"/><text x="261.4" y="220.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">10</text><line x1="332.9" y1="10.0" x2="332.9" y2="202.0" style="stroke:var(--rule);stroke-width:1"/><text x="332.9" y="220.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">20</text><line x1="404.3" y1="10.0" x2="404.3" y2="202.0" style="stroke:var(--rule);stroke-width:1"/><text x="404.3" y="220.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">30</text><line x1="475.7" y1="10.0" x2="475.7" y2="202.0" style="stroke:var(--rule);stroke-width:1"/><text x="475.7" y="220.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">40</text><line x1="547.1" y1="10.0" x2="547.1" y2="202.0" style="stroke:var(--rule);stroke-width:1"/><text x="547.1" y="220.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">50</text><line x1="618.6" y1="10.0" x2="618.6" y2="202.0" style="stroke:var(--rule);stroke-width:1"/><text x="618.6" y="220.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">60</text><line x1="690.0" y1="10.0" x2="690.0" y2="202.0" style="stroke:var(--rule);stroke-width:1"/><text x="690.0" y="220.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">70 ms</text><g class="mark" tabindex="0" data-tip="構成 A（既定）: 60.6〜63.9 ms/step、A との比 1.0×" aria-label="構成 A（既定）: 60.6〜63.9 ms/step、A との比 1.0×"><rect x="190.0" y="24.0" width="432.9" height="20.0" style="fill:var(--bar-muted-base)"/><path d="M622.9,24.0 H642.4 A4.0,4.0 0 0 1 646.4,28.0 V40.0 A4.0,4.0 0 0 1 642.4,44.0 H622.9 Z" style="fill:var(--bar-muted-range)"/></g><text x="0.0" y="32.0" font-size="13" text-anchor="start" font-weight="500" style="fill:var(--ink)">A　既定</text><text x="0.0" y="49.0" font-size="11.5" text-anchor="start" style="fill:var(--muted)">60.6〜63.9 ms</text><text x="654.4" y="38.5" font-size="12.5" text-anchor="start" class="halo" style="fill:var(--ink)">1.0×</text><g class="mark" tabindex="0" data-tip="構成 B（Marlin）: 41.3〜43.3 ms/step、A との比 1.5×" aria-label="構成 B（Marlin）: 41.3〜43.3 ms/step、A との比 1.5×"><rect x="190.0" y="72.0" width="295.0" height="20.0" style="fill:var(--bar-muted-base)"/><path d="M485.0,72.0 H495.3 A4.0,4.0 0 0 1 499.3,76.0 V88.0 A4.0,4.0 0 0 1 495.3,92.0 H485.0 Z" style="fill:var(--bar-muted-range)"/></g><text x="0.0" y="80.0" font-size="13" text-anchor="start" font-weight="500" style="fill:var(--ink)">B　Marlin</text><text x="0.0" y="97.0" font-size="11.5" text-anchor="start" style="fill:var(--muted)">41.3〜43.3 ms</text><text x="507.3" y="86.5" font-size="12.5" text-anchor="start" class="halo" style="fill:var(--ink)">1.5×</text><g class="mark" tabindex="0" data-tip="構成 C（修正 6 件）: 28.4〜29.8 ms/step、A との比 2.1×" aria-label="構成 C（修正 6 件）: 28.4〜29.8 ms/step、A との比 2.1×"><rect x="190.0" y="120.0" width="202.9" height="20.0" style="fill:var(--bar-muted-base)"/><path d="M392.9,120.0 H398.9 A4.0,4.0 0 0 1 402.9,124.0 V136.0 A4.0,4.0 0 0 1 398.9,140.0 H392.9 Z" style="fill:var(--bar-muted-range)"/></g><text x="0.0" y="128.0" font-size="13" text-anchor="start" font-weight="500" style="fill:var(--ink)">C　修正 6 件</text><text x="0.0" y="145.0" font-size="11.5" text-anchor="start" style="fill:var(--muted)">28.4〜29.8 ms</text><text x="410.9" y="134.5" font-size="12.5" text-anchor="start" class="halo" style="fill:var(--ink)">2.1×</text><g class="mark" tabindex="0" data-tip="構成 D（修正 9 件（提案））: 26.1〜27.7 ms/step、A との比 2.3×" aria-label="構成 D（修正 9 件（提案））: 26.1〜27.7 ms/step、A との比 2.3×"><rect x="190.0" y="168.0" width="186.4" height="20.0" style="fill:var(--bar-base)"/><path d="M376.4,168.0 H383.9 A4.0,4.0 0 0 1 387.9,172.0 V184.0 A4.0,4.0 0 0 1 383.9,188.0 H376.4 Z" style="fill:var(--bar-range)"/></g><text x="0.0" y="176.0" font-size="13" text-anchor="start" font-weight="700" style="fill:var(--ink)">D　修正 9 件（提案）</text><text x="0.0" y="193.0" font-size="11.5" text-anchor="start" style="fill:var(--muted)">26.1〜27.7 ms</text><text x="395.9" y="182.5" font-size="12.5" text-anchor="start" font-weight="700" class="halo" style="fill:var(--ink)">2.3×</text></svg></div>
+    <figcaption><b>図 5</b>構成ごとの 1 ステップの時間。帯は根元から 5 本の要求の最小値までと、最小値から最大値まで（先端）を色で分けた。右の値は A との比。</figcaption>
+  </figure>
+
+  <h3><span class="num">5.3</span>寄与の分解</h3>
+  <p>図 6 に、各最適化を加えたときの 1 ステップの短縮を示す。値は最適化を表 A1 の順に積み上げたときの、直前の構成との差で、互いに独立な寄与ではない。ただし、ドラフトの FP8 <code>lm_head</code>・<code>main_proj</code> 分割は L2 先読みより先に加えて測った（前者は C との差、後者は C に前者を加えた構成との差。表 7 の注）。値の取り方も項目によって異なる。Marlin は A と B の範囲の両端どうしの差、<code>wo_a</code> の線形化は直前の構成との比較で記録した値（基準の要求ごとの値が残っていない）、ドラフトの語彙分担は 4.6 節の近似で測った値、RDMA all-reduce はその近似を入れた構成どうしの要求ごとの差、ほかは 5 本の要求ごとの差の範囲である。短縮の和は 33.2〜38.9 ms で、A と D の差（34.5〜36.2 ms）とおおむね合う。最大の寄与はカーネルの切り替え（19.3〜20.6 ms）と RDMA all-reduce（8.0〜8.4 ms）で、残りの 7 項目（修正 8 件。共有エキスパートとルーターは 1 項目にまとめた）は 1 項目あたり 0.1〜2.8 ms である。同じ構成を測り直したときの差（要求ごとに 0〜0.5 ms、3.2 節）を考えると、0.5 ms 前後以下の寄与は測定の揺れと区別できない。</p>
+
+  <figure class="wide chart" id="fig6">
+    <div class="fig-scroll"><svg viewBox="0 0 800 326" role="img" aria-label="最適化ごとの 1 ステップの短縮。Marlin への切り替え（dense・MoE） 19.3〜20.6 ms、RDMA all-reduce 8.0〜8.4 ms、エキスパートの中間次元 384→320 1.9〜2.8 ms、ドラフトの語彙分担 1.1〜1.9 ms、wo_a を通常の線形層に 1.2〜1.5 ms、L2 先読み（MoE・attention の窓） 0.5〜1.1 ms、w13 のゼロ行の削除 0.6〜1.0 ms、ドラフトの FP8 lm_head・main_proj 分割 0.5〜1.0 ms、共有エキスパートとルーター 0.1〜0.6 ms"><line x1="288.0" y1="8.0" x2="288.0" y2="296.0" style="stroke:var(--ink-2);stroke-width:1"/><text x="288.0" y="314.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">0</text><line x1="366.7" y1="8.0" x2="366.7" y2="296.0" style="stroke:var(--rule);stroke-width:1"/><text x="366.7" y="314.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">4</text><line x1="445.3" y1="8.0" x2="445.3" y2="296.0" style="stroke:var(--rule);stroke-width:1"/><text x="445.3" y="314.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">8</text><line x1="524.0" y1="8.0" x2="524.0" y2="296.0" style="stroke:var(--rule);stroke-width:1"/><text x="524.0" y="314.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">12</text><line x1="602.7" y1="8.0" x2="602.7" y2="296.0" style="stroke:var(--rule);stroke-width:1"/><text x="602.7" y="314.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">16</text><line x1="681.3" y1="8.0" x2="681.3" y2="296.0" style="stroke:var(--rule);stroke-width:1"/><text x="681.3" y="314.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">20</text><line x1="760.0" y1="8.0" x2="760.0" y2="296.0" style="stroke:var(--rule);stroke-width:1"/><text x="760.0" y="314.0" font-size="11" text-anchor="middle" class="mono" style="fill:var(--muted)">24 ms</text><g class="mark" tabindex="0" data-tip="Marlin への切り替え（dense・MoE）: −19.3〜20.6 ms/step" aria-label="Marlin への切り替え（dense・MoE）: −19.3〜20.6 ms/step"><rect x="288.0" y="16.0" width="379.6" height="16.0" style="fill:var(--bar-base)"/><path d="M667.6,16.0 H689.1 A4.0,4.0 0 0 1 693.1,20.0 V28.0 A4.0,4.0 0 0 1 689.1,32.0 H667.6 Z" style="fill:var(--bar-range)"/></g><text x="276.0" y="28.5" font-size="12" text-anchor="end" style="fill:var(--ink)">Marlin への切り替え（dense・MoE）</text><text x="699.1" y="28.5" font-size="11.5" text-anchor="start" class="mono halo" style="fill:var(--ink-2)">−19.3〜20.6</text><g class="mark" tabindex="0" data-tip="RDMA all-reduce: −8.0〜8.4 ms/step" aria-label="RDMA all-reduce: −8.0〜8.4 ms/step"><rect x="288.0" y="48.0" width="157.3" height="16.0" style="fill:var(--bar-base)"/><path d="M445.3,48.0 H449.3 A3.9,3.9 0 0 1 453.2,51.9 V60.1 A3.9,3.9 0 0 1 449.3,64.0 H445.3 Z" style="fill:var(--bar-range)"/></g><text x="276.0" y="60.5" font-size="12" text-anchor="end" style="fill:var(--ink)">RDMA all-reduce</text><text x="459.2" y="60.5" font-size="11.5" text-anchor="start" class="mono halo" style="fill:var(--ink-2)">−8.0〜8.4</text><g class="mark" tabindex="0" data-tip="エキスパートの中間次元 384→320: −1.9〜2.8 ms/step" aria-label="エキスパートの中間次元 384→320: −1.9〜2.8 ms/step"><rect x="288.0" y="80.0" width="37.4" height="16.0" style="fill:var(--bar-base)"/><path d="M325.4,80.0 H339.1 A4.0,4.0 0 0 1 343.1,84.0 V92.0 A4.0,4.0 0 0 1 339.1,96.0 H325.4 Z" style="fill:var(--bar-range)"/></g><text x="276.0" y="92.5" font-size="12" text-anchor="end" style="fill:var(--ink)">エキスパートの中間次元 384→320</text><text x="349.1" y="92.5" font-size="11.5" text-anchor="start" class="mono halo" style="fill:var(--ink-2)">−1.9〜2.8</text><g class="mark" tabindex="0" data-tip="ドラフトの語彙分担: −1.1〜1.9 ms/step" aria-label="ドラフトの語彙分担: −1.1〜1.9 ms/step"><rect x="288.0" y="112.0" width="21.6" height="16.0" style="fill:var(--bar-base)"/><path d="M309.6,112.0 H321.4 A4.0,4.0 0 0 1 325.4,116.0 V124.0 A4.0,4.0 0 0 1 321.4,128.0 H309.6 Z" style="fill:var(--bar-range)"/></g><text x="276.0" y="124.5" font-size="12" text-anchor="end" style="fill:var(--ink)">ドラフトの語彙分担</text><text x="331.4" y="124.5" font-size="11.5" text-anchor="start" class="mono halo" style="fill:var(--ink-2)">−1.1〜1.9</text><g class="mark" tabindex="0" data-tip="wo_a を通常の線形層に: −1.2〜1.5 ms/step" aria-label="wo_a を通常の線形層に: −1.2〜1.5 ms/step"><rect x="288.0" y="144.0" width="23.6" height="16.0" style="fill:var(--bar-base)"/><path d="M311.6,144.0 H314.6 A3.0,3.0 0 0 1 317.5,146.9 V157.1 A3.0,3.0 0 0 1 314.6,160.0 H311.6 Z" style="fill:var(--bar-range)"/></g><text x="276.0" y="156.5" font-size="12" text-anchor="end" style="fill:var(--ink)">wo_a を通常の線形層に</text><text x="323.5" y="156.5" font-size="11.5" text-anchor="start" class="mono halo" style="fill:var(--ink-2)">−1.2〜1.5</text><g class="mark" tabindex="0" data-tip="L2 先読み（MoE・attention の窓）: −0.5〜1.1 ms/step" aria-label="L2 先読み（MoE・attention の窓）: −0.5〜1.1 ms/step"><rect x="288.0" y="176.0" width="9.8" height="16.0" style="fill:var(--bar-base)"/><path d="M297.8,176.0 H305.6 A4.0,4.0 0 0 1 309.6,180.0 V188.0 A4.0,4.0 0 0 1 305.6,192.0 H297.8 Z" style="fill:var(--bar-range)"/></g><text x="276.0" y="188.5" font-size="12" text-anchor="end" style="fill:var(--ink)">L2 先読み（MoE・attention の窓）</text><text x="315.6" y="188.5" font-size="11.5" text-anchor="start" class="mono halo" style="fill:var(--ink-2)">−0.5〜1.1</text><g class="mark" tabindex="0" data-tip="w13 のゼロ行の削除: −0.6〜1.0 ms/step" aria-label="w13 のゼロ行の削除: −0.6〜1.0 ms/step"><rect x="288.0" y="208.0" width="11.8" height="16.0" style="fill:var(--bar-base)"/><path d="M299.8,208.0 H303.7 A3.9,3.9 0 0 1 307.7,211.9 V220.1 A3.9,3.9 0 0 1 303.7,224.0 H299.8 Z" style="fill:var(--bar-range)"/></g><text x="276.0" y="220.5" font-size="12" text-anchor="end" style="fill:var(--ink)">w13 のゼロ行の削除</text><text x="313.7" y="220.5" font-size="11.5" text-anchor="start" class="mono halo" style="fill:var(--ink-2)">−0.6〜1.0</text><g class="mark" tabindex="0" data-tip="ドラフトの FP8 lm_head・main_proj 分割: −0.5〜1.0 ms/step" aria-label="ドラフトの FP8 lm_head・main_proj 分割: −0.5〜1.0 ms/step"><rect x="288.0" y="240.0" width="9.8" height="16.0" style="fill:var(--bar-base)"/><path d="M297.8,240.0 H303.7 A4.0,4.0 0 0 1 307.7,244.0 V252.0 A4.0,4.0 0 0 1 303.7,256.0 H297.8 Z" style="fill:var(--bar-range)"/></g><text x="276.0" y="252.5" font-size="12" text-anchor="end" style="fill:var(--ink)">ドラフトの FP8 lm_head・main_proj 分割</text><text x="313.7" y="252.5" font-size="11.5" text-anchor="start" class="mono halo" style="fill:var(--ink-2)">−0.5〜1.0</text><g class="mark" tabindex="0" data-tip="共有エキスパートとルーター: −0.1〜0.6 ms/step" aria-label="共有エキスパートとルーター: −0.1〜0.6 ms/step"><rect x="288.0" y="272.0" width="2.0" height="16.0" style="fill:var(--bar-base)"/><path d="M290.0,272.0 H295.8 A4.0,4.0 0 0 1 299.8,276.0 V284.0 A4.0,4.0 0 0 1 295.8,288.0 H290.0 Z" style="fill:var(--bar-range)"/></g><text x="276.0" y="284.5" font-size="12" text-anchor="end" style="fill:var(--ink)">共有エキスパートとルーター</text><text x="305.8" y="284.5" font-size="11.5" text-anchor="start" class="mono halo" style="fill:var(--ink-2)">−0.1〜0.6</text></svg></div>
+    <figcaption><b>図 6</b>最適化ごとの 1 ステップの短縮（ms）。帯は根元から範囲の下限までと、下限から上限まで（先端）を色で分けた。</figcaption>
+  </figure>
+
+  <p>表 10 に、B と C の 1 ステップの内訳を比べる。通信は 14.2 ms から 4.38 ms に、MoE は 13.67 ms から 9.92 ms に減った。MoE の減少（27%）のうち、ゼロパディングの削減（読み出し 1.33 倍から 1.11 倍）で見込めるのは約 17%（単体測定で 16%）で、残りの約 1 割の要因は切り分けていない。2 つのプロファイルは出力が分岐した別の要求の記録で、読むエキスパートの種類数が同じとは限らない。dense は <code>wo_a</code> を含めて 9.19 ms から 8.21 ms になった。主要な行列は推論中も単体の測定とほぼ同じ時間で動いており（<code>wq_a</code>+<code>wkv</code> が層の中で 44.2 µs、Marlin の dense の単体測定で 43.4 µs。表 5 の L2 先読みの単体測定の測り方では 39.9 µs）、行列積は帯域で決まっている。</p>
+
+  <div class="tbl">
+    <table>
+      <caption><b>表 10</b>B と C の 1 ステップの内訳（ms、torch profiler）</caption>
+      <thead><tr><th>部分</th><th class="n">B</th><th class="n">C</th></tr></thead>
+      <tbody>
+        <tr><td>MoE（ルーティングされるエキスパート）</td><td class="n">13.67</td><td class="n">9.92</td></tr>
+        <tr><td>dense の線形層</td><td class="n">7.16＋<code>wo_a</code> 2.03</td><td class="n">8.21</td></tr>
+        <tr><td>通信（all-reduce・all-gather）</td><td class="n">13.6＋0.6</td><td class="n">4.38</td></tr>
+        <tr><td>BF16・FP32 の行列積（<code>lm_head</code>・ルーター・indexer の射影）</td><td class="n">約 5.7</td><td class="n">3.45</td></tr>
+        <tr><td>mHC</td><td class="n">1.62</td><td class="n">1.71</td></tr>
+        <tr><td>attention・indexer・top-k</td><td class="n">約 1.0</td><td class="n">1.65</td></tr>
+        <tr><td>その他（活性化・MoE の整列・小さな要素演算）</td><td class="n">約 2</td><td class="n">1.38</td></tr>
+      </tbody>
+    </table>
+    <p class="tnote">C はプロファイラ下で 28.8 ms/step。項目の和が 1 ステップの時間を上回るのは、補助ストリームで並行して動くカーネル（共有エキスパートなど）を重ねて数えているためと考えられる。C の内訳と、4.4・5.3 節の推論中の all-reduce と層内の行列積の時間は、C から RDMA all-reduce の fence・有効化の設定の突き合わせ・2 段階の有効化を除いた構成で取得した。それ以外は C と同じで、その <var>t</var><sub>step</sub>（28.5〜29.8 ms）は C と同じ範囲にある。</p>
+  </div>
+
+  <h3><span class="num">5.4</span>並行時と長い文脈</h3>
+  <p>表 11 に、並行時のスループット、長い文脈でのデコード、エージェントの課題の所要を示す。8 本の要求を絶えず流したときの集約スループットは、A の 171.7 tok/s から B の 290.5 tok/s、D の 345 tok/s になった。B から D への伸び（1.19 倍）は単一ストリームの伸び（1.56〜1.58 倍）より小さい。理由は二つ考えられる。一つは、RDMA all-reduce が 5 本までしか使われず、8 本では目標モデルとドラフトの all-reduce が NCCL に戻ることである。8 本（48 トークン）でも先読みは働くが、窓は NCCL の all-reduce と重なり、4.5 節の設計則の前提（RDMA の待ちの間は SM と帯域が空いている）の外にある（この範囲の得失は測っていない）。もう一つは、並行数が増えると MoE が読むエキスパートの種類が増え、本稿の最適化が縮めない部分の比重が大きくなることである。</p>
+  <p>約 49 万トークン（492K）の文脈では、初回の prefill が A の 3,454 tok/s から D の 3,957 tok/s に伸び、prefix cache に当たった後のデコードは B の 42.9 tok/s から D の 60.9 tok/s になった（A の構成ではこのデコードを記録していない）。ただし C（64.1 tok/s）より D が低い。この値は 1 本の要求の生成速度であり、受理長を記録していないため、<var>t</var><sub>step</sub> と受理長のどちらによる差かは切り分けていない。エージェントの課題（OpenCode<span class="cite">[<a href="#ref-42">42</a>]</span> による、Python の CLI ライブラリ click（pallets/click 8.1.7）のリポジトリでの 8 課題の同時実行）では、8 課題の完了までの時間が A の 554 秒から D の 257〜323 秒（2 回）になったが、所要は課題の進め方で大きく揺れるため、1 回ずつの値から構成の差を読むことはできない。</p>
+
+  <div class="tbl wide">
+    <table>
+      <caption><b>表 11</b>並行時のスループット、長い文脈、エージェントの課題</caption>
+      <thead><tr><th>項目</th><th class="n">A</th><th class="n">B</th><th class="n">C</th><th class="n">D</th></tr></thead>
+      <tbody>
+        <tr><td>8 並行の集約スループット [tok/s]</td><td class="n">171.7</td><td class="n">290.5</td><td class="n">—</td><td class="n">345</td></tr>
+        <tr><td>4 並行の集約スループット [tok/s]</td><td class="n">—</td><td class="n">—</td><td class="n">257</td><td class="n">270</td></tr>
+        <tr><td>492K の初回 prefill [tok/s]</td><td class="n">3,454</td><td class="n">3,779</td><td class="n">3,901</td><td class="n">3,957<sup class="fn"><a href="#fn4" id="fnref4">4</a></sup></td></tr>
+        <tr><td>492K の文脈でのデコード [tok/s]</td><td class="n">—</td><td class="n">42.9</td><td class="n">64.1</td><td class="n">60.9<sup class="fn"><a href="#fn4" id="fnref4b">4</a></sup></td></tr>
+        <tr><td>エージェント 8 課題の完了 [s]</td><td class="n">554</td><td class="n">363</td><td class="n">299</td><td class="n">257／323<sup class="fn"><a href="#fn4" id="fnref4c">4</a></sup></td></tr>
+      </tbody>
+    </table>
+    <p class="tnote">集約スループットは、説明とコードを求める 16 種のプロンプトを巡回して 256 トークンずつ（EOS を無視）生成し続けたときの平均（D の 8 並行は 30 分、ほかは 60〜90 分）。492K の初回 prefill は needle 試験の 1 回目の要求（prefix cache を外す）、492K の文脈でのデコードは 2 回目の要求（prefix cache に当たった後、最大 500 トークン）の値。A の構成では 492K の文脈でのデコードを記録していない（投機 k=3、gpu-memory-utilization 0.72 の構成では 34.7 tok/s）。</p>
+  </div>
+
+  <h3><span class="num">5.5</span>品質と安定性</h3>
+  <p>各構成で、次の検査を行った（表 12）。温度 0 の出力検査は 58 件の要求（短い算数 40 件、長い system プロンプトの 8 本同時、約 3 万トークンの needle 2 本同時、長く考える問い 4 本、ツール呼び出しの 2 ターン、prefix cache を使う 2 ターン）について、正答と、出力の崩れ（同じ断片の繰り返し、置換文字、本文への思考タグの混入）を調べる。並行時の正答は 1〜32 本を同時に流して答えを確かめる。needle 試験<span class="cite">[<a href="#ref-43">43</a>]</span>は、最大 492K トークン（C と D は 66K〜492K の 4 段）の文章に埋めた番号を答えさせる。コードの品質は HumanEval+ と MBPP+<span class="cite">[<a href="#ref-44">44</a>, <a href="#ref-45">45</a>, <a href="#ref-46">46</a>]</span> の 542 問（思考あり、温度 0、16 本並行、出力の上限 16,384 トークン）で、連続負荷は 60〜90 分のエラーの有無で見た。</p>
+
+  <div class="tbl wide">
+    <table>
+      <caption><b>表 12</b>品質と安定性（評価に用いたチェックポイントは注 1）</caption>
+      <thead><tr><th>検査</th><th>A</th><th>B</th><th>C</th><th>D</th></tr></thead>
+      <tbody>
+        <tr><td>温度 0 の出力検査（58 件）</td><td>58/58</td><td>58/58</td><td>58/58</td><td>58/58</td></tr>
+        <tr><td>並行時の正答（1〜32 本）</td><td>全問正答</td><td>全問正答</td><td>全問正答</td><td>全問正答</td></tr>
+        <tr><td>needle 試験</td><td>正答（133K・492K）</td><td>正答（492K）</td><td>正答（66K〜492K）</td><td>正答（66K〜492K）<sup class="fn"><a href="#fn4" id="fnref4d">4</a></sup></td></tr>
+        <tr><td>HumanEval+/MBPP+（追加テストまで通った問題数）</td><td>464/542</td><td>467/542</td><td>470/542<sup class="fn"><a href="#fn5" id="fnref5">5</a></sup></td><td>469/542<sup class="fn"><a href="#fn4" id="fnref4e">4</a></sup></td></tr>
+        <tr><td>エージェント（成果物／テスト全通過）</td><td>8/8・8/8</td><td>8/8・8/8</td><td>8/8・7/8</td><td>8/8・7/8（2 回とも）<sup class="fn"><a href="#fn4" id="fnref4f">4</a></sup></td></tr>
+        <tr><td>連続負荷（件数、エラー）</td><td>8 並行 90 分 3,622 件、0</td><td>8 並行 90 分 6,127 件、0</td><td>4 並行 60 分 3,611 件、0</td><td>4 並行 60 分 3,795 件＋8 並行 30 分 2,426 件、0</td></tr>
+      </tbody>
+    </table>
+    <p class="tnote">A の needle の 66K と 263K は、投機 k=3、gpu-memory-utilization 0.72 の構成で正答した。</p>
+  </div>
+
+  <p>温度 0 の出力検査と並行時の正答は、すべての構成で全問を通過した。カーネルや足し算の順序が変われば温度 0 の出力も途中から分岐するので、一致の長さではなく、正答と崩れの有無で判定している。長い思考の軌道はこの分岐の影響を受けやすく、注 4 のビルドでは、長く考える 1 問が思考だけで出力の上限（16,384 トークン）を使い切り、本文が空になる回が 1 回あった（同じ問いを測り直すと正答した）。HumanEval+/MBPP+ の正解数は 464〜470/542 の範囲にある。A と B の問題ごとの入れ替わりは 9 対 12 で、符号検定（両側、p=0.66）では有意な差は見られなかった（C・D については検定していない）。16 本並行では大半のステップで 1 ステップが 96 行になり、目標モデルの all-reduce は NCCL を通り、L2 先読みも働かない。RDMA all-reduce と先読みの経路は、温度 0 の出力検査（直列の 40 件、2 本同時の needle、4 本同時の長く考える問いなど）、並行時の正答（1・2・4 本）、1 本ずつの needle 試験、4 並行の連続負荷で確かめた。エージェントの課題で C と D が落とした 1 件（色の出力を無効にする課題）は、エージェント自身が最後に実行したテストは全通過（592〜596 件）しており、判定側の端末の無い環境でだけ、エージェントが追加した色のテストが落ちたものである。端末の有無に依存するテストを書いたためで、推論の品質の問題ではないと判断した。連続負荷では、どの構成でもエラーは 0 件で、C と D では RDMA の待ちの時間切れも 0 件であった。</p>
+
+  <h3><span class="num">5.6</span>メモリと KV キャッシュの容量</h3>
+  <p>ゼロパディングの削除で、重みは rank あたり 72.4 GiB（削除の直前の構成）から 62.2 GiB（D）に減り、その分が KV キャッシュに回った（表 13）。D の KV キャッシュは 11,766,773 トークンで、512K の文脈なら約 22 本を同時に保持できる。RDMA all-reduce のピン留め領域は rank あたり 72 MiB（要求量）、デバイス上の作業領域は約 37 MiB で、どちらも KV の見積もりより前に確保するので、KV の容量を予期せず削ることはない。</p>
+
+  <div class="tbl">
+    <table>
+      <caption><b>表 13</b>メモリと KV キャッシュの容量</caption>
+      <thead><tr><th>項目</th><th class="n">A</th><th class="n">B</th><th class="n">C</th><th class="n">D</th></tr></thead>
+      <tbody>
+        <tr><td>重み [GiB/rank]</td><td class="n">—</td><td class="n">—</td><td class="n">64.7</td><td class="n">62.2</td></tr>
+        <tr><td>KV キャッシュ [トークン]</td><td class="n">4,533,955</td><td class="n">4,932,736</td><td class="n">10,424,592</td><td class="n">11,766,773</td></tr>
+        <tr><td>待機中の空きメモリ（head）[GiB]</td><td class="n">18</td><td class="n">18</td><td class="n">16</td><td class="n">15</td></tr>
+        <tr><td>負荷時の空きの最小 [GiB]</td><td class="n">16.2〜16.6</td><td class="n">17.6</td><td class="n">14</td><td class="n">14</td></tr>
+      </tbody>
+    </table>
+    <p class="tnote">A は gpu-memory-utilization 0.76、B〜D は 0.74。重みは Engram（約 23.6 GiB/rank）を含む。A・B の重みは記録が無い（ゼロパディングを減らす直前の構成で 72.4 GiB。B は <code>wo_a</code> を BF16 で持つぶんこれより多い）。負荷時は 492K の needle 試験、32 並行、連続負荷のうちの最小。B は 0.74 での連続負荷だけの値で、B の 492K の needle 試験と 32 並行は 0.76 で流し、そのときの最小は 14.2 GiB であった。各ノードでは、ホストの空きが 8 GiB を下回ると推論を止める監視を動かしている。</p>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">6</span>考察</h2>
+
+  <h3><span class="num">6.1</span>残る時間と上限</h3>
+  <p>D の時間の内訳はプロファイラで取っていないが、C の内訳（表 10）から見積もると、D の 1 ステップには次のものが残る。帯域の上限で動く MoE（C で 9.92 ms。D では <code>w13</code> のゼロ行の削除で読み出しが減り、約 9.3 ms と見込まれる）、88 回の all-reduce を含む通信（C で 4.38 ms。D では MoE の窓で先読みと並ぶ all-reduce が延びる分と、<code>main_proj</code> の分割で増える all-reduce の分だけ長いと見込まれる）、dense、mHC、attention の小さなカーネルである。MoE と dense は、単体の測定でコピーの帯域に並ぶ速さで動いており、カーネルの改良で縮む余地は小さい。さらに縮めるには、読むバイトを減らすか、通信と計算の重ね方を変える必要がある。読むバイトの候補は、全 rank に複製している <code>wq_a</code>+<code>wkv</code>・ルーター・mHC 係数の分割や型の縮小（見込み 1〜3 ms）と、受理されそうにない検証行のエキスパートを読まない検証の打ち切り（見込み 1〜3 ms、未評価）である。vLLM の適応的な検証は、SM12x の indexer が可変長の検証に対応していないため、そのままでは使えない。このほか、Engram の層の射影（約 0.2 ms）、ルーターの行列積（1 層約 25 µs、コピーの帯域の約 7 割）、目標モデルの <code>lm_head</code>（0.74 ms、FP8 にするなら品質の確認が要る）が、それぞれ 1〜3% 規模で残る。</p>
+  <p>それ以上は構造の変更になる。層ごとの数十本のカーネルを持続カーネルにまとめ<span class="cite">[<a href="#ref-47">47</a>, <a href="#ref-48">48</a>]</span>、all-reduce をカーネルの中のフラグ待ちで行えば、通信と計算を細かく重ねられる。見込みでは、同じ重みのままで 1 ステップ 21〜24 ms（A 比 2.6〜3 倍）に届くが、特定のモデルに専用の実装を持つことになり、保守の負担が大きい。重みを低ビットにすればエキスパートの読み出しは 3 割前後減るが、品質を優先する本環境の方針とは両立しない。</p>
+
+  <h3><span class="num">6.2</span>統合メモリでの通信と計算の重ね合わせ</h3>
+  <p>通信の待ちを使った先読みは、HBM を持つ NPU（Ascend 910B）の実機で効果が示されている<span class="cite">[<a href="#ref-40">40</a>]</span>。ただし、先読みが通信そのものに与える影響は論じられておらず、L2 の容量を選ぶ設計空間の探索では、通信時間を一定の遅延とデータ量÷リンク帯域でモデル化している。このモデルでは、先読みは通信と重なる限り無償である。GB10 ではこれが成り立たなかった。先読みの読み出しと並ぶ RDMA all-reduce は、読み出しの量と開始の時刻によらず約 10 µs 延び、CTA を減らして読み出しを遅くしても、両方が終わるまでの時間は縮まなかった（16・8・4 CTA では読み出し単独より 7〜22 µs 長い）。CPU のプロキシ、NIC の DMA、GPU のフラグ待ちがすべて同じ LPDDR5X を通ることが原因と考えているが、メモリコントローラの側のカウンタで確かめてはいない。離散 GPU でも、計算と通信を重ねるとカーネルどうしがメモリや SM を取り合って遅くなることが報告されている<span class="cite">[<a href="#ref-49">49</a>, <a href="#ref-50">50</a>]</span>。GB10 では、それに NIC の DMA とプロキシが加わる。したがって GB10 では、通信と重ねる仕事は「重ねても縮む量が、通信の延びより明らかに大きい」ものに限る必要があり、本稿ではこれを、窓ごとの短縮の見積もりと 10 µs 前後の延びの比較として設計に反映した。</p>
+
+  <h3><span class="num">6.3</span>適用範囲</h3>
+  <p>修正の多くは、vLLM の中でモデルに依存しない部分にある。エキスパートの中間次元の 64 単位化と <code>w13</code> のゼロ行の削除は MXFP4 の MoE を Marlin で動かす経路、ルーターの低遅延 GEMM は SM12x のルーター、RDMA all-reduce は GB10 を複数台使う TP の通信に効く。L2 先読みは仕組みが汎用で、窓の登録だけがモデルの側にある。<code>wo_a</code> の線形化、共有エキスパートの読み込み時のパディング（DeepSeek-V4／V4.1 のモデル定義）、ドラフトの 2 件（語彙分担、FP8 の <code>lm_head</code> と <code>main_proj</code> の分割）は、DeepSeek-V4.1 と DSpark に固有である。RDMA all-reduce が有効になるのは、TP グループの rank が 2〜16 で複数ノードにまたがるときだけで、DBO（micro-batching）とは併用できず、FlashInfer に同梱の b12x の通信 API（API の版 1 と準備 API）に依存する。<code>w13</code> のゼロ行の削除は MoE の LoRA を有効にすると使われない。FP8 の <code>lm_head</code> の写しは読み込み時に作るので、重みの入れ替えや sleep（レベル 2）では作り直されない。9 件は特定の nightly への差分なので、版を上げるたびに当て直しが要る。並行数については、RDMA all-reduce の上限（5 本）と先読みの上限（64 トークン）が、本稿の想定する 1〜4 本を覆っている。より大きな並行で使うなら、上限の引き上げと、先読みが NCCL の all-reduce と重なる範囲（6〜10 本）の得失を測る必要がある。</p>
+
+  <h3><span class="num">6.4</span>妥当性への脅威</h3>
+  <p><var>t</var><sub>step</sub> は 5 本の短い要求を 1 回ずつ流した値で、反復による統計は取っていない（同じ構成を起動し直した測り直しの差は、要求ごとに 0〜0.5 ms）。0.5 ms 前後以下の寄与は、この差と同じくらいである。測定では思考を無効にしており、思考を伴う実際の利用での受理長と、エージェントが使う長さの文脈での <var>t</var><sub>step</sub> は測っていない。提案構成（D）の時間の内訳はプロファイラで取っておらず、表 10 は C までである。採用した先読みの窓の組み方での all-reduce の延びも、推論中には確かめていない。並行時の <var>t</var><sub>step</sub> も測っていない。基準の A は FlashInfer の自動チューニングを切った状態の値で、有効にした A は測っていない。A から B への短縮の一部は、この設定による dense の遅さに由来しうる。品質の評価は 1 つのチェックポイント（注 1）でのものである。</p>
+  <p>RDMA all-reduce は、待ちが上限を超えると推論を止める設計で、復旧には推論の再起動が要る。fail-stop が捕まえるのは RDMA ランタイムの失敗（待ちの時間切れ、プロキシの停止）である。出力を返す rank の GPU が RDMA 以外のカーネルで止まった場合は、vLLM の実行の時間切れ（300 秒）まで検知されない。出力を返さない rank が RDMA と無関係の理由でステップの途中に例外を出した場合の集団通信の組み違え（NCCL でも起きる）は、fence では検知できない。論拠はパイプライン並列を使わない（PP=1）生成モデルを前提にしている。また、NCCL より止まりやすい。1 ノードだけで実行時の JIT コンパイルが走るなどして rank の間のずれが約 20〜30 秒を超えると推論が止まり、約 0.5 秒の通信の途絶（QP の ACK の時間切れ 14、再送 7 回）でもプロキシは回復しない。運用では JIT キャッシュを全ノードで同じに温めておく。故障の注入（ノードの一時停止、レールの切断）による試験と、振り分けの上限を変えた比較は行っていない。</p>
+</section>
+
+<section id="s7">
+  <h2><span class="num">7</span>関連研究</h2>
+  <p><strong>推論エンジンと小さいバッチの行列積。</strong>vLLM<span class="cite">[<a href="#ref-5">5</a>]</span> と SGLang<span class="cite">[<a href="#ref-51">51</a>]</span> は、KV キャッシュの管理とスケジューリングで LLM の配信を効率化する。小さいバッチのデコードでは重みの読み出しが支配的になることが、TPU での分析<span class="cite">[<a href="#ref-7">7</a>]</span>やルーフラインのモデル<span class="cite">[<a href="#ref-8">8</a>]</span>から知られている。重みだけを低ビットにする量子化<span class="cite">[<a href="#ref-52">52</a>, <a href="#ref-53">53</a>]</span>と、それを小さいバッチで帯域の上限近くまで動かす Marlin<span class="cite">[<a href="#ref-35">35</a>]</span> は、本稿のカーネル選択の前提である。FlashInfer<span class="cite">[<a href="#ref-27">27</a>]</span>、DeepGEMM<span class="cite">[<a href="#ref-30">30</a>]</span>、CUTLASS<span class="cite">[<a href="#ref-31">31</a>]</span> は vLLM の既定の経路を構成する（CuTe DSL の低遅延 GEMM は Hopper と SM100 でだけ既定で使われ、本稿は SM12x にも広げた）。本稿の結果は、これらの既定の経路（MXFP8 の CUTLASS、FP8×FP4 の DeepGEMM）が TP=8 の小さな形と GB10 では帯域を使い切れず（自動チューニングを切った CUTLASS の dense で約 60 GB/s）、小さいバッチ向けの Marlin に替えるだけで 1 ステップが 19.3〜20.6 ms 縮むこと、そして Marlin に替えた後の行列積に残る損失の大部分が、TP 分割で生じるゼロパディングと形の扱い（その修正で合わせて 3.8〜5.9 ms）に起因することを示している。</p>
+  <p><strong>集団通信。</strong>MPI の集団通信の最適化<span class="cite">[<a href="#ref-33">33</a>]</span>以来、小さなメッセージでは段数の少ないアルゴリズムが有利とされる。NCCL<span class="cite">[<a href="#ref-32">32</a>, <a href="#ref-34">34</a>]</span> は汎用だが、小さなメッセージでは段の往復の遅延が残る。ノード内では、TensorRT-LLM<span class="cite">[<a href="#ref-54">54</a>]</span> や vLLM のカスタム all-reduce<span class="cite">[<a href="#ref-55">55</a>]</span> が one-shot・two-shot の all-reduce をメッセージの大きさで使い分け、TensorRT-LLM の MultiShot<span class="cite">[<a href="#ref-56">56</a>]</span> は NVSwitch のマルチキャストで段数を減らす。MSCCL++<span class="cite">[<a href="#ref-57">57</a>]</span> は通信の抽象を推論向けに設計し直し、SiFAR<span class="cite">[<a href="#ref-58">58</a>]</span> は one-shot all-reduce の前後の同期を固定費と捉えて削減している。GPU 主導の RDMA<span class="cite">[<a href="#ref-14">14</a>]</span> は GPUDirect RDMA<span class="cite">[<a href="#ref-12">12</a>]</span> を前提とするが、GB10 では使えない<span class="cite">[<a href="#ref-13">13</a>]</span>。本稿の RDMA all-reduce は、統合メモリを前提に CPU のプロキシを介する RoCEnante<span class="cite">[<a href="#ref-36">36</a>, <a href="#ref-37">37</a>]</span> と、コミュニティによる vLLM フォークへの組み込み（PR #597<span class="cite">[<a href="#ref-38">38</a>]</span> と、マージされずに閉じた PR #916<span class="cite">[<a href="#ref-39">39</a>]</span> の RoCE の部分）に基づく。#597 の組み込みは、大きさによる振り分け、CUDA グラフでの使用、rank 間の可否の投票、出力を返す rank での健全性の確認による fail-stop を備えていた。本稿はこれを upstream の nightly と FlashInfer 0.7.2 の準備 API に移し、実測に基づく振り分けの上限（320 KiB／4 MiB。フォークは 2 MB／16 MB）、中間の次元の all-gather の平坦化、取り込み中だけ RDMA に回す 2 段階の有効化、有効化の設定の突き合わせと自己試験、毎ステップの fence と失敗した rank での起動の省略を加えた。</p>
+  <p><strong>通信と計算の重ね合わせ。</strong>T3<span class="cite">[<a href="#ref-59">59</a>]</span>、FLUX<span class="cite">[<a href="#ref-60">60</a>]</span>、TileLink<span class="cite">[<a href="#ref-61">61</a>]</span> は、通信と行列積を細かい粒度で重ねる。Comet<span class="cite">[<a href="#ref-62">62</a>]</span> は MoE のエキスパート並列での通信を重ね、NanoFlow<span class="cite">[<a href="#ref-63">63</a>]</span> はバッチを分けて資源を同時に使う。PRESERVE<span class="cite">[<a href="#ref-40">40</a>]</span> は通信の間に後続の重みと KV を L2 へ先読みする点で本稿に最も近いが、HBM の NPU を対象とし、先読みと通信の干渉は扱っていない。重ね合わせによる干渉は離散 GPU で測られている<span class="cite">[<a href="#ref-49">49</a>, <a href="#ref-50">50</a>]</span>。本稿は、GB10 で先読みが RDMA の通信そのものを延ばすことを測り、窓の選び方に反映した。層を持続カーネルにまとめる手法<span class="cite">[<a href="#ref-47">47</a>, <a href="#ref-48">48</a>]</span>は、6.1 節で述べた次の段階にあたる。</p>
+  <p><strong>投機的デコーディング。</strong>小さなドラフトで提案し目標モデルで検証する方式<span class="cite">[<a href="#ref-24">24</a>, <a href="#ref-25">25</a>]</span>は、複数のヘッド<span class="cite">[<a href="#ref-64">64</a>]</span>、目標モデルの特徴量を入力とするドラフト（特徴量の水準での自己回帰<span class="cite">[<a href="#ref-65">65</a>]</span>と、それを複数層の特徴の融合と直接のトークン予測に改めたもの<span class="cite">[<a href="#ref-66">66</a>]</span>）、木構造の検証<span class="cite">[<a href="#ref-67">67</a>]</span>、複数トークンの予測<span class="cite">[<a href="#ref-68">68</a>, <a href="#ref-69">69</a>]</span>、検索による提案<span class="cite">[<a href="#ref-70">70</a>]</span>へと広がった。本稿で用いた DSpark<span class="cite">[<a href="#ref-26">26</a>]</span> は、並列のドラフト生成と軽量な逐次のモジュールを組み合わせる。本稿は方式そのものではなく、TP 環境でのドラフトの固定費（語彙方向の計算と複製された射影）を、目標モデルの出力を変えずに削る点を扱った。</p>
+  <p><strong>統合メモリの計算機。</strong>CPU と GPU がメモリを共有する Grace Hopper では、データの置き場所と移動の性能が詳しく調べられている<span class="cite">[<a href="#ref-71">71</a>, <a href="#ref-72">72</a>]</span>。GB10<span class="cite">[<a href="#ref-3">3</a>, <a href="#ref-4">4</a>]</span> はこれを小型機に持ち込み、さらに NIC も同じメモリを使う。本稿の干渉の測定は、この構成での通信と計算の重ね合わせの特性を示す一例である。</p>
+</section>
+
+<section id="s8">
+  <h2><span class="num">8</span>おわりに</h2>
+  <p>8 台の DGX Spark で DeepSeek-V4.1-Flash-1017 を TP=8 で配信する vLLM について、デコードの時間を分析し、行列積カーネルの選択、TP 分割で生じるゼロパディングの削除、one-shot RDMA all-reduce の組み込み、通信の待ちを使った L2 先読み、投機ドラフトの固定費の削減を行った。短いプロンプトでの単一ストリームの 1 ステップは 60.6〜63.9 ms から 26.1〜27.7 ms になり（2.3 倍）、品質と安定性の検査で低下は見られなかった。最適化はすべて vLLM の Python 層への修正と起動設定で、upstream の改良を取り込み続けられる形にとどめている。GB10 では通信と計算の重ね合わせは無償ではなく、先読みと並ぶ RDMA の通信が 1 回 10 µs 前後延びることも分かった（CPU・GPU・NIC が同じ LPDDR5X を使うことが原因と考えているが、確かめてはいない）。残る時間の大半は帯域の上限で動く行列積と all-reduce で、さらに縮めるには、読むバイトの削減か、通信をカーネルの中に取り込む構造の変更が要る。</p>
+</section>
+
+<section id="appA">
+  <h2><span class="num">付録 A</span>再現のための情報</h2>
+  <p>vLLM の nightly（コミット e68efc685）に、upstream に出された次の修正（PR）3 件を加えたものを土台とした。#62199 は土台の nightly より後に upstream にマージされ、#62535 は本稿の執筆時点で審査中である。#60762 は、FlashInfer 0.7.2 で不要になったとして、マージされないまま閉じられた（本稿の環境でこれを外したときの動作は確かめていない）。</p>
+  <ul>
+    <li>vllm#60762：SM12x で V4.1 の sparse attention と indexer に 64 トークンのカーネルブロックを宣言する（<code>--block-size 64</code> と組み合わせる）。<a href="https://github.com/vllm-project/vllm/pull/60762">https://github.com/vllm-project/vllm/pull/60762</a></li>
+    <li>vllm#62535：prefill を含むバッチを、デコード専用の FULL の CUDA グラフに入れない（DSpark と組み合わせたときの出力の破損 vllm#62417 への対処）。<a href="https://github.com/vllm-project/vllm/pull/62535">https://github.com/vllm-project/vllm/pull/62535</a></li>
+    <li>vllm#62199：プロンプトのエンコーダを、チェックポイントに同梱の参照実装に合わせる。<a href="https://github.com/vllm-project/vllm/pull/62199">https://github.com/vllm-project/vllm/pull/62199</a></li>
+  </ul>
+  <p>その上に表 A1 の 9 件を、表の順に当てる。各差分は、表でそれより上をすべて当てた後のファイルに対するものである。いずれも Python だけの変更で、環境変数で切り替えられる（エキスパートの中間次元の 64 単位化だけは既定で有効で、<code>VLLM_MARLIN_MOE_INTERMEDIATE_ALIGN=128</code> で upstream と同じ動作に戻る）。</p>
+
+  <div class="tbl wide">
+    <table>
+      <caption><b>表 A1</b>本稿の修正（当てる順）</caption>
+      <thead><tr><th>修正</th><th>有効化（既定）</th><th>主な変更箇所</th><th class="n">差分</th><th class="n">短縮 [ms]</th></tr></thead>
+      <tbody>
+        <tr><td><code>wo-a-linear</code></td><td><code>VLLM_DSV41_WO_A_AS_LINEAR=1</code>（0）</td><td>V4.1 の attention、出力射影</td><td class="n">+28/−0</td><td class="n">1.2〜1.5</td></tr>
+        <tr><td><code>dspark-draft</code></td><td><code>VLLM_DSPARK_VOCAB_PARALLEL_MARKOV=1</code>（0）</td><td>DSpark のドラフト、投機の設定</td><td class="n">+115/−0</td><td class="n">1.1〜1.9</td></tr>
+        <tr><td><code>rocenante</code></td><td><code>VLLM_ENABLE_ROCE_ALLREDUCE=1</code>（0）。上限は <code>VLLM_ROCE_ALLREDUCE_MAX_BYTES</code>（320 KiB）、<code>VLLM_ROCE_ALLGATHER_MAX_BYTES</code>（4 MiB）</td><td>通信層、並列状態、ワーカー（新規 <code>b12x_roce_all_reduce.py</code>）</td><td class="n">+1,133/−4</td><td class="n">8.0〜8.4</td></tr>
+        <tr><td><code>marlin-moe-align64</code></td><td><code>VLLM_MARLIN_MOE_INTERMEDIATE_ALIGN</code>（64）</td><td>MXFP4 MoE の重みの準備</td><td class="n">+10/−1</td><td class="n">1.9〜2.8</td></tr>
+        <tr><td><code>shared-expert-tile</code></td><td><code>VLLM_DSV4_SHARED_EXPERT_TILE=64</code>（0）</td><td>V4／V4.1 の共有エキスパート</td><td class="n">+23/−2</td><td class="n" rowspan="2">0.1〜0.6</td></tr>
+        <tr><td><code>gate-ll-gemm-sm12x</code></td><td><code>VLLM_GATE_LL_GEMM_SM12X=1</code>（0）</td><td>MoE のルーター</td><td class="n">+10/−1</td></tr>
+        <tr><td><code>l2-prefetch</code></td><td><code>VLLM_L2_PREFETCH=1</code>（0）。窓 <code>VLLM_L2_PREFETCH_WINDOWS</code>（moe,attn）、上限 <code>VLLM_L2_PREFETCH_MAX_TOKENS</code>（64）、CTA 数 <code>VLLM_L2_PREFETCH_CTAS</code>（48）</td><td>新規 <code>l2_prefetch.py</code>、通信層、V4.1 のモデルと attention、DSpark</td><td class="n">+380/−1</td><td class="n">0.5〜1.1</td></tr>
+        <tr><td><code>dspark-draft-head</code></td><td><code>VLLM_DSPARK_FP8_HEAD=1</code>、<code>VLLM_DSPARK_TP_MAIN_PROJ=1</code>（ともに 0）</td><td>DSpark のドラフト</td><td class="n">+112/−11</td><td class="n">0.5〜1.0</td></tr>
+        <tr><td><code>marlin-moe-w13-unpad</code></td><td><code>VLLM_MARLIN_MOE_W13_UNPAD=1</code>（0）</td><td>Marlin の MoE、MXFP4 の重みの準備</td><td class="n">+64/−7</td><td class="n">0.6〜1.0</td></tr>
+      </tbody>
+    </table>
+    <p class="tnote">合計は 17 ファイル、追加 1,875 行・削除 27 行。短縮の値の取り方は 5.3 節（<code>wo-a-linear</code> は記録値、<code>dspark-draft</code> は上位 4,096 候補の近似で測った値、<code>rocenante</code> はその近似を入れた構成どうしの差、<code>l2-prefetch</code> は <code>dspark-draft-head</code> を加えた構成との差）。<code>VLLM_DSPARK_TP_MAIN_PROJ</code> と <code>VLLM_DSPARK_VOCAB_PARALLEL_MARKOV</code> は TP の集団通信の並びを変えるので、全 rank で同じ値にする。FP8 の <code>lm_head</code> の写しは語彙分担が有効なときだけ使われる。</p>
+  </div>
+
+  <p>起動の設定（チェックポイントのパスとモデル名は省略）を次に示す。</p>
+<pre><code>vllm serve &lt;checkpoint&gt; \
+  --tensor-parallel-size 8 --distributed-executor-backend ray \
+  --gpu-memory-utilization 0.74 --max-model-len 524288 \
+  --kv-cache-dtype fp8 --block-size 64 \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
+  --linear-backend marlin --kernel-config '{"moe_backend":"MARLIN"}' \
+  --no-enable-flashinfer-autotune --engram-config '{"cpu_offload":false}' \
+  --tokenizer-mode deepseek_v41 --tool-call-parser deepseek_v41 \
+  --reasoning-parser deepseek_v41 --enable-auto-tool-choice \
+  --trust-remote-code --limit-mm-per-prompt '{"image":4}'</code></pre>
+  <p>vLLM に渡す環境変数と、コンテナの設定のうち主なものを次に示す。vLLM の環境変数はノードのコンテナではなく <code>vllm serve</code> のコマンドに付ける（Ray がドライバの環境をワーカーへ <code>setdefault</code> で写すので、ノード側に別の値があるとそちらが勝つ）。各ノードのコンテナは、RDMA に要るピン留めの上限の解除と <code>/dev/infiniband</code> を付け、ホストの OS の分を残すようメモリを 110 GiB に制限して起動し、制御の通信は 10GbE 側に固定する。統合メモリの GB10 では、<code>NCCL_IB_PCI_RELAXED_ORDERING=0</code> を明示しないと、NCCL の RDMA のメモリ登録が失敗してソケット通信に切り替わる。</p>
+<pre><code># vllm serve に付ける環境変数
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MAX_JOBS=2 FLASHINFER_NVCC_THREADS=1
+VLLM_DSV41_WO_A_AS_LINEAR=1 VLLM_DSPARK_VOCAB_PARALLEL_MARKOV=1
+VLLM_ENABLE_ROCE_ALLREDUCE=1 B12X_COMPILE_CACHE_DIR=&lt;JIT キャッシュの置き場&gt;
+VLLM_DSV4_SHARED_EXPERT_TILE=64 VLLM_GATE_LL_GEMM_SM12X=1 VLLM_L2_PREFETCH=1
+VLLM_DSPARK_FP8_HEAD=1 VLLM_DSPARK_TP_MAIN_PROJ=1 VLLM_MARLIN_MOE_W13_UNPAD=1
+
+# コンテナ（各ノード）
+docker run --privileged --ipc=host --ulimit memlock=-1 --memory=110g --shm-size=64g \
+  --device /dev/infiniband ...
+NCCL_IB_DISABLE=0 NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0 NCCL_IB_GID_INDEX=3
+NCCL_IB_PCI_RELAXED_ORDERING=0 NCCL_MAX_NCHANNELS=4 NCCL_IGNORE_CPU_AFFINITY=1
+NCCL_SOCKET_IFNAME=&lt;制御網の IF&gt; GLOO_SOCKET_IFNAME=&lt;同&gt;
+TP_SOCKET_IFNAME=&lt;同&gt; UCX_NET_DEVICES=&lt;同&gt;</code></pre>
+</section>
+
+<section id="appB">
+  <h2><span class="num">付録 B</span>測定の道具</h2>
+  <ul>
+    <li><code>vllm-steptime.py</code>：3.2 節の 5 本の要求を 1 本ずつ流し、<code>/metrics</code> の投機のステップ数の差から <var>t</var><sub>step</sub> と <var>τ</var> を出す。</li>
+    <li><code>vllm-needle.py</code>：乱数の単語列の深さ 37% に番号を埋め、初回（prefix cache を外す）で prefill の速さと正誤を、2 回目（同じ本文に別の質問）で長い文脈でのデコードの速さを測る。</li>
+    <li><code>vllm-greedy-diff.py</code>、<code>vllm-concurrency-check.py</code>：5.5 節の温度 0 の出力検査と並行時の正答。</li>
+    <li><code>vllm-soak.py</code>：一定の並行数で要求を流し続け、1 分ごとの集約スループット、エラー、受理長を記録する。</li>
+    <li><code>spark-bench/</code>：単体測定の道具。メモリ帯域、FP8 GEMV、NCCL と RDMA の all-reduce の遅延、all-reduce と読み出しの干渉は、推論を止めて 8 台に同時に配って実行する。Marlin の MoE と dense は推論を止めて、L2 先読みは推論を止めるか要求の無いときに、それぞれ 1 台で vLLM のイメージの中で測る。ルーティングされたエキスパートの種類数は、<code>--enable-return-routed-experts</code> を付けて起動した推論に要求を流し、推論コンテナの中で数える。干渉の測定スクリプト（<code>roce-contention.py</code>）がそのままで測るのは 9 MiB・48 CTA × 8 warp の組と開始の遅延で、表 6 の 4 MiB と 16 CTA × 4 warp の行（と表 6 の注の 8・4 CTA）は、同じスクリプトの読み出しの組（CTA 数・warp 数・量）を替えて測った。</li>
+  </ul>
+</section>
+
+<section id="notes" class="notes">
+  <h2>注</h2>
+  <ol>
+    <li id="fn1"><span class="rn">1</span><span>評価に用いたチェックポイントは、公式の DeepSeek-V4.1-Flash-1017 と config、テンソルの構成、量子化の形式が同一で、値が異なるのは層 10〜36 の <code>attn.wo_b</code> と <code>ffn.shared_experts.w2</code>（108 テンソル、1.45 GB）だけの派生版である。ルーティングされるエキスパート、Engram、ドラフトの層は公式版と同一である。1 ステップの時間はテンソルの形と形式でほぼ決まるが、受理長と品質の評価値はこのチェックポイントでの値である。 <a href="#fnref1" aria-label="本文へ戻る">↩</a></span></li>
+    <li id="fn2"><span class="rn">2</span><span>FlashInfer の起動時の自動チューニングは無効にしている（<code>--no-enable-flashinfer-autotune</code>）。起動時に rank の間の待ち合わせが止まる事象への対処である。upstream には修正（vllm#57635）があるが、本稿の nightly でこの指定がなお要るかは確かめていない。CUTLASS が調整前の構成で動くことが、既定の dense が遅い一因と考えられる。 <a href="#fnref2" aria-label="本文へ戻る">↩</a></span></li>
+    <li id="fn3"><span class="rn">3</span><span>GPU のメモリの割り当て率（gpu-memory-utilization）は A で 0.76、B〜D で 0.74 である。ただし B の表 9 の値と、表 11・12 の 492K の文脈、needle 試験、HumanEval+/MBPP+、エージェントの課題は 0.76 で測った（B の連続負荷とその 8 並行の集約、表 13 の KV と待機中の空きは 0.74）。この値は KV キャッシュの量と空きメモリを変えるが、1 ステップの時間はほとんど変えない（B は 0.76 で 41.3〜43.3 ms、0.74 で 41.2〜43.2 ms）。 <a href="#fnref3" aria-label="本文へ戻る">↩</a></span></li>
+    <li id="fn4"><span class="rn">4</span><span>D の HumanEval+/MBPP+、needle 試験（表 11 の 492K の 2 行を含む）、エージェントの課題は、本稿の設定では動作を変えない入力の検査 2 か所（先読みの CTA 数の上限と、<code>w13</code> のゼロ行の削除を MoE の LoRA と併用しない条件）だけが D と異なるビルドで取得した。<var>t</var><sub>step</sub>、温度 0 の出力検査、並行時の正答、連続負荷は D で取得した。 <a href="#fnref4" aria-label="本文へ戻る">↩</a></span></li>
+    <li id="fn5"><span class="rn">5</span><span>C の HumanEval+/MBPP+ は、C から共有エキスパートとルーターの修正を除き、RDMA all-reduce に 4.4 節の 2 段階の有効化・有効化の設定の突き合わせ・fence を含めない構成で取得した。 <a href="#fnref5" aria-label="本文へ戻る">↩</a></span></li>
+  </ol>
+</section>
+
+<section id="refs" class="refs">
+  <h2>参考文献</h2>
+  <ol><li id="ref-1"><span class="rn">[1]</span><span>J. Yang, C. E. Jimenez, A. Wettig, K. Lieret, S. Yao, K. Narasimhan, O. Press. <span class="t">SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering</span>. NeurIPS 2024. <a href="https://arxiv.org/abs/2405.15793">https://arxiv.org/abs/2405.15793</a></span></li><li id="ref-2"><span class="rn">[2]</span><span>C. E. Jimenez, J. Yang, A. Wettig, S. Yao, K. Pei, O. Press, K. Narasimhan. <span class="t">SWE-bench: Can Language Models Resolve Real-World GitHub Issues?</span> ICLR 2024. <a href="https://arxiv.org/abs/2310.06770">https://arxiv.org/abs/2310.06770</a></span></li><li id="ref-3"><span class="rn">[3]</span><span>NVIDIA. <span class="t">DGX Spark User Guide: Hardware Overview</span>. NVIDIA documentation（2026-10-21 参照）. <a href="https://docs.nvidia.com/dgx/dgx-spark/hardware.html">https://docs.nvidia.com/dgx/dgx-spark/hardware.html</a></span></li><li id="ref-4"><span class="rn">[4]</span><span>A. Skende. <span class="t">NVIDIA GB10 SoC: AI Supercomputer On Your Desk</span>. Hot Chips 37（HC37）, 2025. <a href="https://www.hc2025.hotchips.org/assets/program/conference/day2/21_nvidia_skende_final.pdf">https://www.hc2025.hotchips.org/assets/program/conference/day2/21_nvidia_skende_final.pdf</a></span></li><li id="ref-5"><span class="rn">[5]</span><span>W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. E. Gonzalez, H. Zhang, I. Stoica. <span class="t">Efficient Memory Management for Large Language Model Serving with PagedAttention</span>. SOSP 2023. <a href="https://arxiv.org/abs/2309.06180">https://arxiv.org/abs/2309.06180</a></span></li><li id="ref-6"><span class="rn">[6]</span><span>M. Shoeybi, M. Patwary, R. Puri, P. LeGresley, J. Casper, B. Catanzaro. <span class="t">Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</span>. arXiv:1909.08053, 2019. <a href="https://arxiv.org/abs/1909.08053">https://arxiv.org/abs/1909.08053</a></span></li><li id="ref-7"><span class="rn">[7]</span><span>R. Pope, S. Douglas, A. Chowdhery, J. Devlin, J. Bradbury, et al. <span class="t">Efficiently Scaling Transformer Inference</span>. MLSys 2023. <a href="https://arxiv.org/abs/2211.05102">https://arxiv.org/abs/2211.05102</a></span></li><li id="ref-8"><span class="rn">[8]</span><span>S. Williams, A. Waterman, D. Patterson. <span class="t">Roofline: An Insightful Visual Performance Model for Multicore Architectures</span>. Communications of the ACM 52(4):65–76, 2009. <a href="https://doi.org/10.1145/1498765.1498785">https://doi.org/10.1145/1498765.1498785</a></span></li><li id="ref-9"><span class="rn">[9]</span><span>DeepSeek-AI. <span class="t">DeepSeek-V4.1-Flash: Pushing the Limits of KV Cache Compression</span>. arXiv:2609.19969, 2026. <a href="https://arxiv.org/abs/2609.19969">https://arxiv.org/abs/2609.19969</a></span></li><li id="ref-10"><span class="rn">[10]</span><span>DeepSeek-AI. <span class="t">DeepSeek-V4.1-Flash-1017（model card）</span>. Hugging Face, 2026. <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017">https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017</a></span></li><li id="ref-11"><span class="rn">[11]</span><span>NVIDIA. <span class="t">CUDA GPU Compute Capability</span>. NVIDIA Developer（2026-10-21 参照）. <a href="https://developer.nvidia.com/cuda-gpus">https://developer.nvidia.com/cuda-gpus</a></span></li><li id="ref-12"><span class="rn">[12]</span><span>NVIDIA. <span class="t">GPUDirect RDMA</span>. NVIDIA documentation（2026-10-21 参照）. <a href="https://docs.nvidia.com/cuda/gpudirect-rdma/index.html">https://docs.nvidia.com/cuda/gpudirect-rdma/index.html</a></span></li><li id="ref-13"><span class="rn">[13]</span><span>NVIDIA. <span class="t">DGX Spark Porting Guide: CUDA</span>. NVIDIA documentation（2026-10-21 参照）. <a href="https://docs.nvidia.com/dgx/dgx-spark-porting-guide/porting/cuda.html">https://docs.nvidia.com/dgx/dgx-spark-porting-guide/porting/cuda.html</a></span></li><li id="ref-14"><span class="rn">[14]</span><span>P. Markthub, J. Dinan, S. Potluri, S. Howell. <span class="t">Improving Network Performance of HPC Systems Using NVIDIA Magnum IO NVSHMEM and GPUDirect Async</span>. NVIDIA Technical Blog, 2022. <a href="https://developer.nvidia.com/blog/improving-network-performance-of-hpc-systems-using-nvidia-magnum-io-nvshmem-and-gpudirect-async">https://developer.nvidia.com/blog/improving-network-performance-of-hpc-systems-using-nvidia-magnum-io-nvshmem-and-gpudirect-async</a></span></li><li id="ref-15"><span class="rn">[15]</span><span>DeepSeek-AI. <span class="t">DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence</span>. arXiv:2606.19348, 2026. <a href="https://arxiv.org/abs/2606.19348">https://arxiv.org/abs/2606.19348</a></span></li><li id="ref-16"><span class="rn">[16]</span><span>D. Dai, C. Deng, C. Zhao, R. X. Xu, H. Gao, D. Chen, J. Li, et al. <span class="t">DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models</span>. ACL 2024. <a href="https://arxiv.org/abs/2401.06066">https://arxiv.org/abs/2401.06066</a></span></li><li id="ref-17"><span class="rn">[17]</span><span>DeepSeek-AI. <span class="t">DeepSeek-V3.2-Exp: Boosting Long-Context Efficiency with DeepSeek Sparse Attention</span>. Technical report, 2025. <a href="https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf">https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf</a></span></li><li id="ref-18"><span class="rn">[18]</span><span>Z. Xie, Y. Wei, H. Cao, C. Zhao, C. Deng, J. Li, D. Dai, H. Gao, et al. <span class="t">mHC: Manifold-Constrained Hyper-Connections</span>. arXiv:2512.24880, 2025. <a href="https://arxiv.org/abs/2512.24880">https://arxiv.org/abs/2512.24880</a></span></li><li id="ref-19"><span class="rn">[19]</span><span>D. Zhu, H. Huang, Z. Huang, Y. Zeng, Y. Mao, B. Wu, Q. Min, X. Zhou. <span class="t">Hyper-Connections</span>. ICLR 2025. <a href="https://arxiv.org/abs/2409.19606">https://arxiv.org/abs/2409.19606</a></span></li><li id="ref-20"><span class="rn">[20]</span><span>X. Cheng, W. Zeng, D. Dai, Q. Chen, B. Wang, Z. Xie, et al. <span class="t">Conditional Memory via Scalable Lookup: A New Axis of Sparsity for Large Language Models</span>. ACL 2026. <a href="https://aclanthology.org/2026.acl-long.226/">https://aclanthology.org/2026.acl-long.226/</a></span></li><li id="ref-21"><span class="rn">[21]</span><span>P. Micikevicius, D. Stosic, N. Burgess, M. Cornea, P. Dubey, et al. <span class="t">FP8 Formats for Deep Learning</span>. arXiv:2209.05433, 2022. <a href="https://arxiv.org/abs/2209.05433">https://arxiv.org/abs/2209.05433</a></span></li><li id="ref-22"><span class="rn">[22]</span><span>B. D. Rouhani, R. Zhao, A. More, M. Hall, A. Khodamoradi, S. Deng, et al. <span class="t">Microscaling Data Formats for Deep Learning</span>. arXiv:2310.10537, 2023. <a href="https://arxiv.org/abs/2310.10537">https://arxiv.org/abs/2310.10537</a></span></li><li id="ref-23"><span class="rn">[23]</span><span>Open Compute Project. <span class="t">OCP Microscaling Formats (MX) Specification, Version 1.0</span>. Specification, 2023. <a href="https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf">https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf</a></span></li><li id="ref-24"><span class="rn">[24]</span><span>Y. Leviathan, M. Kalman, Y. Matias. <span class="t">Fast Inference from Transformers via Speculative Decoding</span>. ICML 2023. <a href="https://arxiv.org/abs/2211.17192">https://arxiv.org/abs/2211.17192</a></span></li><li id="ref-25"><span class="rn">[25]</span><span>C. Chen, S. Borgeaud, G. Irving, J.-B. Lespiau, L. Sifre, J. Jumper. <span class="t">Accelerating Large Language Model Decoding with Speculative Sampling</span>. arXiv:2302.01318, 2023. <a href="https://arxiv.org/abs/2302.01318">https://arxiv.org/abs/2302.01318</a></span></li><li id="ref-26"><span class="rn">[26]</span><span>X. Cheng, X. Yu, C. Shao, J. Li, Y. Xiong, Y. Qian, J. Zhu, et al. <span class="t">DSpark: Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation</span>. arXiv:2607.05147, 2026. <a href="https://arxiv.org/abs/2607.05147">https://arxiv.org/abs/2607.05147</a></span></li><li id="ref-27"><span class="rn">[27]</span><span>Z. Ye, L. Chen, R. Lai, W. Lin, Y. Zhang, S. Wang, T. Chen, et al. <span class="t">FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving</span>. MLSys 2025. <a href="https://arxiv.org/abs/2501.01005">https://arxiv.org/abs/2501.01005</a></span></li><li id="ref-28"><span class="rn">[28]</span><span>P. Moritz, R. Nishihara, S. Wang, A. Tumanov, R. Liaw, E. Liang, et al. <span class="t">Ray: A Distributed Framework for Emerging AI Applications</span>. OSDI 2018. <a href="https://www.usenix.org/conference/osdi18/presentation/moritz">https://www.usenix.org/conference/osdi18/presentation/moritz</a></span></li><li id="ref-29"><span class="rn">[29]</span><span>NVIDIA. <span class="t">CUDA Programming Guide: CUDA Graphs</span>. NVIDIA documentation（2026-10-21 参照）. <a href="https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html">https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html</a></span></li><li id="ref-30"><span class="rn">[30]</span><span>C. Zhao, Z. Xu, L. Zhao, J. Li, et al. <span class="t">DeepGEMM: clean and efficient BLAS kernel library on GPU</span>. GitHub: deepseek-ai/DeepGEMM, 2025. <a href="https://github.com/deepseek-ai/DeepGEMM">https://github.com/deepseek-ai/DeepGEMM</a></span></li><li id="ref-31"><span class="rn">[31]</span><span>NVIDIA. <span class="t">CUTLASS: CUDA Templates and Python DSLs for High-Performance Linear Algebra（CuTe DSL を含む）</span>. GitHub: NVIDIA/cutlass（2026-10-21 参照）. <a href="https://github.com/NVIDIA/cutlass">https://github.com/NVIDIA/cutlass</a></span></li><li id="ref-32"><span class="rn">[32]</span><span>NVIDIA. <span class="t">NCCL User Guide</span>. NVIDIA documentation（2026-10-21 参照）. <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/index.html">https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/index.html</a></span></li><li id="ref-33"><span class="rn">[33]</span><span>R. Thakur, R. Rabenseifner, W. Gropp. <span class="t">Optimization of Collective Communication Operations in MPICH</span>. The International Journal of High Performance Computing Applications, 2005. <a href="https://doi.org/10.1177/1094342005051521">https://doi.org/10.1177/1094342005051521</a></span></li><li id="ref-34"><span class="rn">[34]</span><span>Z. Hu, S. Shen, T. Bonato, S. Jeaugey, C. Alexander, E. Spada, J. Dinan, J. Hammond, T. Hoefler. <span class="t">Demystifying NCCL: An In-depth Analysis of GPU Communication Protocols and Algorithms</span>. HOTI 2025. <a href="https://arxiv.org/abs/2507.04786">https://arxiv.org/abs/2507.04786</a></span></li><li id="ref-35"><span class="rn">[35]</span><span>E. Frantar, R. L. Castro, J. Chen, T. Hoefler, D. Alistarh. <span class="t">MARLIN: Mixed-Precision Auto-Regressive Parallel Inference on Large Language Models</span>. PPoPP 2025. <a href="https://arxiv.org/abs/2408.11743">https://arxiv.org/abs/2408.11743</a></span></li><li id="ref-36"><span class="rn">[36]</span><span>FlashInfer contributors. <span class="t">b12x.comm.roce（RoCEnante）: one-shot RoCE all-reduce and all-gather runtime for multi-node tensor parallelism</span>. FlashInfer v0.7.2 source code, 2026. <a href="https://github.com/flashinfer-ai/flashinfer/blob/v0.7.2/flashinfer/experimental/b12x/comm/roce/roce_oneshot.py">https://github.com/flashinfer-ai/flashinfer/blob/v0.7.2/flashinfer/experimental/b12x/comm/roce/roce_oneshot.py</a></span></li><li id="ref-37"><span class="rn">[37]</span><span>lukealonso. <span class="t">feat(experimental): migrate b12x to experimental submodule（flashinfer-ai/flashinfer PR #5767、v0.7.2 に収録）</span>. GitHub, 2026. <a href="https://github.com/flashinfer-ai/flashinfer/pull/5767">https://github.com/flashinfer-ai/flashinfer/pull/5767</a></span></li><li id="ref-38"><span class="rn">[38]</span><span>original-el8. <span class="t">distributed: RoCEnante shim for b12x one-shot RoCE collectives on multi-node DGX Spark（local-inference-lab/vllm PR #597、vLLM のフォーク）</span>. GitHub, 2026. <a href="https://github.com/local-inference-lab/vllm/pull/597">https://github.com/local-inference-lab/vllm/pull/597</a></span></li><li id="ref-39"><span class="rn">[39]</span><span>tobymao. <span class="t">feat(worker): GPU stall watchdog; RoCEnante health on every rank（local-inference-lab/vllm PR #916、マージされずに閉じた）</span>. GitHub, 2026. <a href="https://github.com/local-inference-lab/vllm/pull/916">https://github.com/local-inference-lab/vllm/pull/916</a></span></li><li id="ref-40"><span class="rn">[40]</span><span>A. C. Yüzügüler, J. Zhuang, L. Cavigelli. <span class="t">PRESERVE: Prefetching Model Weights and KV-Cache in Distributed LLM Serving</span>. arXiv:2501.08192, 2025. <a href="https://arxiv.org/abs/2501.08192">https://arxiv.org/abs/2501.08192</a></span></li><li id="ref-41"><span class="rn">[41]</span><span>NVIDIA. <span class="t">Parallel Thread Execution ISA: prefetch, cp.async.bulk.prefetch</span>. NVIDIA documentation（2026-10-21 参照）. <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html">https://docs.nvidia.com/cuda/parallel-thread-execution/index.html</a></span></li><li id="ref-42"><span class="rn">[42]</span><span>OpenCode contributors. <span class="t">OpenCode: The open source coding agent</span>. GitHub, 2025（2026-10-21 参照）. <a href="https://github.com/anomalyco/opencode">https://github.com/anomalyco/opencode</a></span></li><li id="ref-43"><span class="rn">[43]</span><span>G. Kamradt. <span class="t">Needle In A Haystack: Pressure Testing LLMs</span>. GitHub, 2023. <a href="https://github.com/gkamradt/needle-in-a-haystack">https://github.com/gkamradt/needle-in-a-haystack</a></span></li><li id="ref-44"><span class="rn">[44]</span><span>M. Chen, J. Tworek, H. Jun, Q. Yuan, H. P. de Oliveira Pinto, J. Kaplan, et al. <span class="t">Evaluating Large Language Models Trained on Code</span>. arXiv:2107.03374, 2021. <a href="https://arxiv.org/abs/2107.03374">https://arxiv.org/abs/2107.03374</a></span></li><li id="ref-45"><span class="rn">[45]</span><span>J. Austin, A. Odena, M. Nye, M. Bosma, H. Michalewski, D. Dohan, et al. <span class="t">Program Synthesis with Large Language Models</span>. arXiv:2108.07732, 2021. <a href="https://arxiv.org/abs/2108.07732">https://arxiv.org/abs/2108.07732</a></span></li><li id="ref-46"><span class="rn">[46]</span><span>J. Liu, C. S. Xia, Y. Wang, L. Zhang. <span class="t">Is Your Code Generated by ChatGPT Really Correct? Rigorous Evaluation of Large Language Models for Code Generation</span>. NeurIPS 2023. <a href="https://arxiv.org/abs/2305.01210">https://arxiv.org/abs/2305.01210</a></span></li><li id="ref-47"><span class="rn">[47]</span><span>B. Spector, J. Juravsky, S. Sul, O. Dugan, D. Lim, D. Fu, S. Arora, C. Ré. <span class="t">Look Ma, No Bubbles! Designing a Low-Latency Megakernel for Llama-1B</span>. Hazy Research Blog, 2025. <a href="https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles">https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles</a></span></li><li id="ref-48"><span class="rn">[48]</span><span>X. Cheng, Z. Zhang, Y. Zhou, J. Ji, J. Jiang, Z. Zhao, et al. <span class="t">MPK: A Compiler and Runtime for Mega-Kernelizing Tensor Programs</span>. OSDI 2026. <a href="https://www.usenix.org/conference/osdi26/presentation/cheng">https://www.usenix.org/conference/osdi26/presentation/cheng</a></span></li><li id="ref-49"><span class="rn">[49]</span><span>A. Agrawal, S. Aga, S. Pati, M. Islam. <span class="t">Optimizing ML Concurrent Computation and Communication with GPU DMA Engines</span>. arXiv:2412.14335, 2024. <a href="https://arxiv.org/abs/2412.14335">https://arxiv.org/abs/2412.14335</a></span></li><li id="ref-50"><span class="rn">[50]</span><span>S. Lee, J. Oh, J. Kim, S. Go, J. Park, D. Mahajan. <span class="t">Characterizing Compute-Communication Overlap in GPU-Accelerated Distributed Deep Learning: Performance and Power Implications</span>. arXiv:2507.03114, 2025. <a href="https://arxiv.org/abs/2507.03114">https://arxiv.org/abs/2507.03114</a></span></li><li id="ref-51"><span class="rn">[51]</span><span>L. Zheng, L. Yin, Z. Xie, C. Sun, J. Huang, C. H. Yu, et al. <span class="t">SGLang: Efficient Execution of Structured Language Model Programs</span>. NeurIPS 2024. <a href="https://arxiv.org/abs/2312.07104">https://arxiv.org/abs/2312.07104</a></span></li><li id="ref-52"><span class="rn">[52]</span><span>E. Frantar, S. Ashkboos, T. Hoefler, D. Alistarh. <span class="t">GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</span>. ICLR 2023. <a href="https://arxiv.org/abs/2210.17323">https://arxiv.org/abs/2210.17323</a></span></li><li id="ref-53"><span class="rn">[53]</span><span>J. Lin, J. Tang, H. Tang, S. Yang, W.-M. Chen, W.-C. Wang, G. Xiao, X. Dang, C. Gan, S. Han. <span class="t">AWQ: Activation-aware Weight Quantization for On-Device LLM Compression and Acceleration</span>. MLSys 2024. <a href="https://arxiv.org/abs/2306.00978">https://arxiv.org/abs/2306.00978</a></span></li><li id="ref-54"><span class="rn">[54]</span><span>NVIDIA. <span class="t">TensorRT-LLM Python API: tensorrt_llm.functional.allreduce（AllReduceStrategy）</span>. TensorRT-LLM documentation, v1.0.0rc4. <a href="https://nvidia.github.io/TensorRT-LLM/1.0.0rc4/python-api/tensorrt_llm.functional.html">https://nvidia.github.io/TensorRT-LLM/1.0.0rc4/python-api/tensorrt_llm.functional.html</a></span></li><li id="ref-55"><span class="rn">[55]</span><span>hanzhi713. <span class="t">Custom all reduce kernels（vllm-project/vllm PR #2192）</span>. GitHub, 2024. <a href="https://github.com/vllm-project/vllm/pull/2192">https://github.com/vllm-project/vllm/pull/2192</a></span></li><li id="ref-56"><span class="rn">[56]</span><span>A. Korzh, B. Pharris, N. Comly, A. Eassa, A. Elmeleegy. <span class="t">3x Faster AllReduce with NVSwitch and TensorRT-LLM MultiShot</span>. NVIDIA Technical Blog, 2024. <a href="https://developer.nvidia.com/blog/3x-faster-allreduce-with-nvswitch-and-tensorrt-llm-multishot">https://developer.nvidia.com/blog/3x-faster-allreduce-with-nvswitch-and-tensorrt-llm-multishot</a></span></li><li id="ref-57"><span class="rn">[57]</span><span>C. Hwang, P. Cheng, R. Dathathri, A. Jangda, S. Maleki, M. Musuvathi, et al. <span class="t">MSCCL++: Rethinking GPU Communication Abstractions for AI Inference</span>. ASPLOS 2026. <a href="https://arxiv.org/abs/2504.09014">https://arxiv.org/abs/2504.09014</a></span></li><li id="ref-58"><span class="rn">[58]</span><span>H. Taneja, A. Saxena, A. Revinipati, J. H. Ju, N. C. Crago, M. Qureshi. <span class="t">SiFAR: Synchronization-Free All-Reduce for Low-Latency LLM Inference</span>. arXiv:2607.08973, 2026. <a href="https://arxiv.org/abs/2607.08973">https://arxiv.org/abs/2607.08973</a></span></li><li id="ref-59"><span class="rn">[59]</span><span>S. Pati, S. Aga, M. Islam, N. Jayasena, M. D. Sinclair. <span class="t">T3: Transparent Tracking &amp; Triggering for Fine-grained Overlap of Compute &amp; Collectives</span>. ASPLOS 2024. <a href="https://arxiv.org/abs/2401.16677">https://arxiv.org/abs/2401.16677</a></span></li><li id="ref-60"><span class="rn">[60]</span><span>L.-W. Chang, W. Bao, Q. Hou, C. Jiang, N. Zheng, Y. Zhong, et al. <span class="t">FLUX: Fast Software-based Communication Overlap On GPUs Through Kernel Fusion</span>. arXiv:2406.06858, 2024. <a href="https://arxiv.org/abs/2406.06858">https://arxiv.org/abs/2406.06858</a></span></li><li id="ref-61"><span class="rn">[61]</span><span>S. Zheng, J. Fang, X. Zheng, Q. Hou, W. Bao, N. Zheng, et al. <span class="t">TileLink: Generating Efficient Compute-Communication Overlapping Kernels using Tile-Centric Primitives</span>. MLSys 2025. <a href="https://arxiv.org/abs/2503.20313">https://arxiv.org/abs/2503.20313</a></span></li><li id="ref-62"><span class="rn">[62]</span><span>S. Zhang, N. Zheng, H. Lin, Z. Jiang, W. Bao, C. Jiang, et al. <span class="t">Comet: Fine-grained Computation-communication Overlapping for Mixture-of-Experts</span>. MLSys 2025. <a href="https://arxiv.org/abs/2502.19811">https://arxiv.org/abs/2502.19811</a></span></li><li id="ref-63"><span class="rn">[63]</span><span>K. Zhu, Y. Gao, Y. Zhao, L. Zhao, G. Zuo, Y. Gu, et al. <span class="t">NanoFlow: Towards Optimal Large Language Model Serving Throughput</span>. OSDI 2025. <a href="https://www.usenix.org/conference/osdi25/presentation/zhu-kan">https://www.usenix.org/conference/osdi25/presentation/zhu-kan</a></span></li><li id="ref-64"><span class="rn">[64]</span><span>T. Cai, Y. Li, Z. Geng, H. Peng, J. D. Lee, D. Chen, T. Dao. <span class="t">Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads</span>. ICML 2024. <a href="https://arxiv.org/abs/2401.10774">https://arxiv.org/abs/2401.10774</a></span></li><li id="ref-65"><span class="rn">[65]</span><span>Y. Li, F. Wei, C. Zhang, H. Zhang. <span class="t">EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty</span>. ICML 2024. <a href="https://arxiv.org/abs/2401.15077">https://arxiv.org/abs/2401.15077</a></span></li><li id="ref-66"><span class="rn">[66]</span><span>Y. Li, F. Wei, C. Zhang, H. Zhang. <span class="t">EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test</span>. NeurIPS 2025. <a href="https://arxiv.org/abs/2503.01840">https://arxiv.org/abs/2503.01840</a></span></li><li id="ref-67"><span class="rn">[67]</span><span>X. Miao, G. Oliaro, Z. Zhang, X. Cheng, Z. Wang, Z. Zhang, et al. <span class="t">SpecInfer: Accelerating Large Language Model Serving with Tree-based Speculative Inference and Verification</span>. ASPLOS 2024. <a href="https://arxiv.org/abs/2305.09781">https://arxiv.org/abs/2305.09781</a></span></li><li id="ref-68"><span class="rn">[68]</span><span>F. Gloeckle, B. Y. Idrissi, B. Rozière, D. Lopez-Paz, G. Synnaeve. <span class="t">Better &amp; Faster Large Language Models via Multi-token Prediction</span>. ICML 2024. <a href="https://arxiv.org/abs/2404.19737">https://arxiv.org/abs/2404.19737</a></span></li><li id="ref-69"><span class="rn">[69]</span><span>DeepSeek-AI. <span class="t">DeepSeek-V3 Technical Report</span>. arXiv:2412.19437, 2024. <a href="https://arxiv.org/abs/2412.19437">https://arxiv.org/abs/2412.19437</a></span></li><li id="ref-70"><span class="rn">[70]</span><span>G. Oliaro, Z. Jia, D. Campos, A. Qiao. <span class="t">SuffixDecoding: Extreme Speculative Decoding for Emerging AI Applications</span>. NeurIPS 2025. <a href="https://arxiv.org/abs/2411.04975">https://arxiv.org/abs/2411.04975</a></span></li><li id="ref-71"><span class="rn">[71]</span><span>G. Schieffer, J. Wahlgren, J. Ren, J. Faj, I. Peng. <span class="t">Harnessing Integrated CPU-GPU System Memory for HPC: a first look into Grace Hopper</span>. ICPP 2024. <a href="https://arxiv.org/abs/2407.07850">https://arxiv.org/abs/2407.07850</a></span></li><li id="ref-72"><span class="rn">[72]</span><span>L. Fusco, M. Khalilov, M. Chrapek, G. Chukkapalli, T. Schulthess, T. Hoefler. <span class="t">Understanding Data Movement in Tightly Coupled Heterogeneous Systems: A Case Study with the Grace Hopper Superchip</span>. arXiv:2408.11556, 2024. <a href="https://arxiv.org/abs/2408.11556">https://arxiv.org/abs/2408.11556</a></span></li></ol>
+</section>
+
+<footer class="colophon">2026年10月作成。性能・メモリ・品質の数値は本環境での実測で、重みの読み出し量はテンソルの形とルーティングの記録からの計算値、メモリの帯域 273 GB/s と L2 の容量 24 MB は公称値である。見込みと記した値は測定していない。</footer>
+
+</article>
+
+<div class="tip" id="tip" hidden></div>
+<script>
+(() => {
+  const tip = document.getElementById('tip');
+  if (!tip) return;
+  const place = (x, y) => {
+    const pad = 12, w = tip.offsetWidth, h = tip.offsetHeight;
+    let left = x + pad, top = y - h - pad;
+    if (left + w > window.innerWidth - 8) left = x - w - pad;
+    if (top < 8) top = y + pad;
+    tip.style.left = Math.max(8, left) + 'px';
+    tip.style.top = top + 'px';
+  };
+  document.querySelectorAll('[data-tip]').forEach((el) => {
+    const show = () => { tip.textContent = el.getAttribute('data-tip'); tip.hidden = false; };
+    el.addEventListener('pointerenter', (e) => { show(); place(e.clientX, e.clientY); });
+    el.addEventListener('pointermove', (e) => place(e.clientX, e.clientY));
+    el.addEventListener('pointerleave', () => { tip.hidden = true; });
+    el.addEventListener('focus', () => { show(); const r = el.getBoundingClientRect(); place(r.left + r.width / 2, r.top); });
+    el.addEventListener('blur', () => { tip.hidden = true; });
+  });
+})();
+</script>
+</body>
+</html>
